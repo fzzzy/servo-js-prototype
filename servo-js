@@ -1,0 +1,19 @@
+#!/usr/bin/env cjs
+
+let url = arguments[0];
+
+if (url) {
+    run("../pavel.js/pavel.js");
+
+    try {
+        let servo = pavel.spawn("../servo/servo.js");
+        servo.cast("url", url);
+        pavel.drain();
+    } catch (e) {
+        print("Exception:");
+        print(e);
+        print(e.stack);
+    }
+} else {
+    print("Usage: servo-js url");
+}
