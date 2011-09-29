@@ -1,0 +1,1 @@
+g++ -Ijs -Ijs/dist/include -Ilibev-4.04 main.c js/libjs_static.a libev-4.04/ev.o -o servo

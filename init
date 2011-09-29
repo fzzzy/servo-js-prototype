@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+curl -O http://ftp.mozilla.org/pub/mozilla.org/js/js185-1.0.0.tar.gz
+tar xzf js185-1.0.0.tar.gz
+mv js-1.8.5/js/src js
+rm -rf js-1.8.5
+rm js185-1.0.0.tar.gz
+cd js
+./configure
+make
+cd ..
+
+curl -O http://dist.schmorp.de/libev/libev-4.04.tar.gz
+tar xzf libev-4.04.tar.gz
+rm libev-4.04.tar.gz
+cd libev-4.04
+./configure
+make
+cd ..
+
