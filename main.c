@@ -15,8 +15,7 @@ typedef struct _continuation {
 static Continuation *runnables[4096];
 static int runnables_outstanding = 0;
 
-static JSBool global_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags,
-               JSObject **objp) {
+static JSBool global_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags, JSObject **objp) {
     JSBool resolved;
 
     if (!JS_ResolveStandardClass(cx, obj, id, &resolved))
@@ -31,7 +30,7 @@ static JSBool global_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags,
 static JSClass global_class = {
     "global", JSCLASS_NEW_RESOLVE | JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_PRIVATE,
     JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
-    JS_EnumerateStub, (JSResolveOp) global_resolve, JS_ConvertStub, JS_FinalizeStub,
+    JS_EnumerateStub, (JSResolveOp)global_resolve, JS_ConvertStub, JS_FinalizeStub,
     JSCLASS_NO_OPTIONAL_MEMBERS
 };
 
@@ -49,12 +48,15 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
     struct hostent *hostrec;
 
+    printf("foo!\n");
     int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "Si", &string, &port);
     if (!result) {
         JS_ReportError(cx, "Invalid arguments to connect. Expected host, port");
         return JS_FALSE;
     }
     JS_EncodeStringToBuffer(string, host, 256);
+    host[JS_GetStringLength(string)] = NULL;
+    printf("host %s\n", host);
     hostrec = gethostbyname(host);
 
     if (!hostrec) {
@@ -95,63 +97,130 @@ JSBool servo_close(JSContext *cx, uintN argc, jsval *vp) {
 }
 
 static void timer_callback (EV_P_ ev_timer *w, int revents) {
-    printf("timer callback\n");
     Continuation * cont = (Continuation *)w->data;
     jsval rval;
-    
+
     JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_data", cont->data);
     int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('wait', _data)", 19, "main", 0, &rval);
+    JS_RemoveValueRoot(cont->cx, cont->data);
+
     runnables[runnables_outstanding++] = cont;
     free(w);
 }
 
 JSBool servo_schedule_timer(JSContext *cx, uintN argc, jsval *vp) {
     jsdouble timeout = 0.1;
-    jsval * data;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "do", &timeout, &data);
+    jsdouble raw;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "dd", &timeout, &raw);
     if (!result) {
         JS_ReportError(cx, "Invalid timeout");
         return JS_FALSE;
     }
-    printf("s!!chedule timer %f\n", timeout);
-    ev_timer *timer = (ev_timer *)malloc(sizeof(ev_timer));
-    ev_timer_init(timer, timer_callback, timeout, 0.);
+
     Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
     cnt->cx = cx;
-    cnt->data = vp;
+    cnt->data = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, raw, cnt->data);
+    JS_AddValueRoot(cx, cnt->data);
+
+    ev_timer *timer = (ev_timer *)malloc(sizeof(ev_timer));
+    ev_timer_init(timer, timer_callback, timeout, 0.);
     timer->data = (void *)cnt;
-    ev_timer_start(ev_default_loop(), timer);
+    ev_timer_start(ev_default_loop(0), timer);
     return JS_TRUE;
 }
 
-static void io_callback(EV_P_ ev_io *w, int revents) {
-    ev_io_stop(ev_default_loop(), w);
+static void read_callback(EV_P_ ev_io *w, int revents) {
+    Continuation * cont = (Continuation *)w->data;
+    JSContext *cx = cont->cx;
+    int32 howmuch;
+    jsval rval;
+
+    JS_ValueToInt32(cx, *cont->data, &howmuch);
+    char * buffer = (char *)malloc(howmuch);
+
+    JS_RemoveValueRoot(cx, cont->data);
+
+    uint32 amountread = recv(w->fd, buffer, howmuch, 0);
+    buffer[amountread] = NULL;
+    printf("buffer %s\n", buffer);
+    jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(cx, buffer, amountread));
+    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_data", &the_string);
+    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('recv', [_data])", 21, "main", 0, &rval);
+
+    
+
+    printf("readcallback\n");
+    ev_io_stop(ev_default_loop(0), w);
     free(w);
 }
 
 JSBool servo_schedule_read(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "u", &fileno);
+    int howmuch = 0;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uu", &fileno, &howmuch);
     if (!result) {
-        JS_ReportError(cx, "Invalid fileno");
+        JS_ReportError(cx, "Invalid arguments: expected fileno, howmuch");
         return JS_FALSE;
     }
+    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
+    cnt->cx = cx;
+    cnt->data = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, howmuch, cnt->data);
+    JS_AddValueRoot(cx, cnt->data);
+
     ev_io *io = (ev_io *)malloc(sizeof(ev_io));
-    ev_io_init(io, io_callback, fileno, EV_READ);
-    ev_io_start(ev_default_loop(), io);
+    ev_io_init(io, read_callback, fileno, EV_READ);
+    io->data = (void *)cnt;
+    ev_io_start(ev_default_loop(0), io);
+    printf("Schedule read\n");
     return JS_TRUE;
+}
+
+static void write_callback(EV_P_ ev_io *w, int revents) {
+    printf("IO callback! %d\n", revents);
+    Continuation * cont = (Continuation *)w->data;
+    JSContext *cx = cont->cx;
+    JSString *to_write_str = (JSString *)cont->data;
+    int size = JS_GetStringLength(to_write_str);
+    char * to_write = JS_EncodeString(cx, to_write_str);
+    int size_sent = send(w->fd, to_write, size, 0);
+    if (size_sent == size) {
+        printf("Sentall\n");
+
+        jsval rval;
+        jsval *fd = (jsval *)malloc(sizeof(jsval));
+        JS_NewNumberValue(cx, w->fd, fd);
+        JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_fd", fd);
+        int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('send', [_fd])", 19, "main", 0, &rval);
+        runnables[runnables_outstanding++] = cont;
+
+        ev_io_stop(ev_default_loop(0), w);
+        free(w);
+    } else {
+        printf("notallsent!\n");
+        // TODO really need to figure out a way to trigger this for testing.
+        cont->data = (jsval *)JS_NewStringCopyN(cx, to_write + size_sent, size - size_sent);
+    }
 }
 
 JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "u", &fileno);
+    JSString *data;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uS", &fileno, &data);
     if (!result) {
-        JS_ReportError(cx, "Invalid fileno");
+        JS_ReportError(cx, "Invalid arguments: expected fileno, data");
         return JS_FALSE;
     }
+    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
+    cnt->cx = cx;
+    cnt->data = (jsval *)data;
+
     ev_io *io = (ev_io *)malloc(sizeof(ev_io));
-    ev_io_init(io, io_callback, fileno, EV_WRITE);
-    ev_io_start(ev_default_loop(), io);
+    ev_io_init(io, write_callback, fileno, EV_WRITE);
+    io->data = (void *)cnt;
+    ev_io_start(ev_default_loop(0), io);
+    printf("Schedule write\n");
     return JS_TRUE;
 }
 
@@ -243,7 +312,6 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
         return NULL;
 
     str = JS_ValueToString(cx, rval);
-    printf("exec1 %s\n", JS_EncodeString(cx, str));
 
     JSScript *domjs = JS_CompileFile(cx, global, "/Users/donovan/Code/dom.js/dom.js");
     if (!domjs)
@@ -254,7 +322,6 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
         return NULL;
 
     str = JS_ValueToString(cx, rval);
-    printf("exec2 %s\n", JS_EncodeString(cx, str));
 
     Continuation *cont = (Continuation *)malloc(sizeof(Continuation));
     cont->cx = cx;
@@ -264,7 +331,15 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
 }
 
 int main(int argc, const char *argv[]) {
-    struct ev_loop *loop = ev_default_loop();
+    struct ev_loop *loop = ev_default_loop(0);
+
+    jsval rval;
+    JSString *str;
+    JSBool ok;
+
+    JSObject *sandbox;
+    JSContext *runnable;
+    Continuation *continuation;
 
     JSRuntime *rt = JS_NewRuntime(8 * 1024 * 1024);
     if (rt == NULL)
@@ -273,35 +348,29 @@ int main(int argc, const char *argv[]) {
     if (!spawn(rt, "servo.js"))
         return 1;
 
-    if (!spawn(rt, "servo.js"))
-        return 1;
-
     // *************************************************************
     while (runnables_outstanding) {
-        Continuation *cont = runnables[--runnables_outstanding];
-        JSContext *runnable = cont->cx;
-        JSObject *sandbox = JS_GetGlobalObject(runnable);
+        while (runnables_outstanding) {
+            continuation = runnables[--runnables_outstanding];
+            runnable = continuation->cx;
+            free(continuation);
 
-        jsval rval;
-        JSString *str;
-        JSBool ok;
+            sandbox = JS_GetGlobalObject(runnable);
+            ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
+            if (!ok) {
+                return 1;
+            }
+            str = JS_ValueToString(runnable, rval);
 
-        ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
-        if (!ok) {
-            printf("FAIL\n");
-            return 1;
+            // *************************************************************
         }
-        str = JS_ValueToString(runnable, rval);
-        printf("exec3 %s\n", JS_EncodeString(runnable, str));
-
-        // *************************************************************
+        printf("running\n");
         ev_run(loop, 0);
+        printf("ran\n");
     }
 
     /* Clean things up and shut down SpiderMonkey. */
-    //JS_DestroyContext(cx);
     JS_DestroyRuntime(rt);
     JS_ShutDown();
-    //ev_sleep(0.5);
     return 0;
 }
