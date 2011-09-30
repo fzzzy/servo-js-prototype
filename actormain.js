@@ -21,7 +21,6 @@
     let _xhrid = 0;
 
     function cast(pattern, message) {
-        print("cast", pattern, message);
         _mailbox.push([pattern, message]);
     }
 
@@ -32,7 +31,6 @@
     }
     Result.prototype.toString = function() { return "[object Result(" + this._val + ")]" }
     function result(val) {
-        print(new Error().stack);
         return new Result(val);
     }
 
@@ -44,11 +42,9 @@
         recv: function recv(howmuch) {
             schedule_read(this._fd, howmuch);
             let r = yield new SuspendUntil("recv");
-            print("result", r, r[1]);
             yield result(r[1]);
         },
         send: function send(data) {
-            print("send", data);
             schedule_write(this._fd, data);
             let r = yield new SuspendUntil("send");
             yield result(r[1]);
@@ -61,9 +57,7 @@
 
     function connect(host, port) {
         let sock = new Socket(host, port);
-        print("connect");
         sock._fd = socket_connect(host, port, sock._id);
-        print("connected");
         return sock;
         //let r = yield new SuspendUntil("connect");
         //sock._fd = r[0];
@@ -89,7 +83,6 @@
     }
 
     function _actor_main() {
-        print("ACTOR MAIN", _next, _pattern);
         if (!_gen_stack.length) {
             _gen_stack = [_main()];
             _next = _gen_stack[0].next();
@@ -100,7 +93,7 @@
                 let i = 0;
                 if (_pattern !== Any) {
                     for ( ; i < _mailbox.length; i++) {
-                        if (_mailbox[i][0] === _pattern) {print("pattern match", _pattern, _mailbox[i]); break };
+                        if (_mailbox[i][0] === _pattern) break;
                     }
                 }
                 if (i === _mailbox.length) {
@@ -123,7 +116,6 @@
                 return _pattern;
             } else if (_next instanceof Result) {
                 // a value to pump into a generator
-                print("instanceof Result", _next);
                 try {
                     _next = _gen_stack[_gen_stack.length - 1].send(_next._val);
                 } catch (e) {

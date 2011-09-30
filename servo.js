@@ -1,7 +1,7 @@
 
 let result = connect("127.0.0.1", 6000);
 
-print(result);
+print("Opened socket", result);
 
 yield result.send("hello world");
 let echo = yield result.recv(4096);

@@ -48,7 +48,6 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
     struct hostent *hostrec;
 
-    printf("foo!\n");
     int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "Si", &string, &port);
     if (!result) {
         JS_ReportError(cx, "Invalid arguments to connect. Expected host, port");
@@ -56,7 +55,6 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     }
     JS_EncodeStringToBuffer(string, host, 256);
     host[JS_GetStringLength(string)] = NULL;
-    printf("host %s\n", host);
     hostrec = gethostbyname(host);
 
     if (!hostrec) {
@@ -143,7 +141,6 @@ static void read_callback(EV_P_ ev_io *w, int revents) {
 
     uint32 amountread = recv(w->fd, buffer, howmuch, 0);
     buffer[amountread] = NULL;
-    printf("buffer %s\n", buffer);
     jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(cx, buffer, amountread));
     jsval *fd = (jsval *)malloc(sizeof(jsval));
     JS_NewNumberValue(cx, w->fd, fd);
@@ -153,7 +150,6 @@ static void read_callback(EV_P_ ev_io *w, int revents) {
 
     runnables[runnables_outstanding++] = cont;
 
-    printf("readcallback\n");
     ev_io_stop(ev_default_loop(0), w);
     free(w);
 }
@@ -176,12 +172,10 @@ JSBool servo_schedule_read(JSContext *cx, uintN argc, jsval *vp) {
     ev_io_init(io, read_callback, fileno, EV_READ);
     io->data = (void *)cnt;
     ev_io_start(ev_default_loop(0), io);
-    printf("Schedule read\n");
     return JS_TRUE;
 }
 
 static void write_callback(EV_P_ ev_io *w, int revents) {
-    printf("IO callback! %d\n", revents);
     Continuation * cont = (Continuation *)w->data;
     JSContext *cx = cont->cx;
     JSString *to_write_str = (JSString *)cont->data;
@@ -189,8 +183,6 @@ static void write_callback(EV_P_ ev_io *w, int revents) {
     char * to_write = JS_EncodeString(cx, to_write_str);
     int size_sent = send(w->fd, to_write, size, 0);
     if (size_sent == size) {
-        printf("Sentall\n");
-
         jsval rval;
         jsval *fd = (jsval *)malloc(sizeof(jsval));
         JS_NewNumberValue(cx, w->fd, fd);
@@ -223,7 +215,6 @@ JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     ev_io_init(io, write_callback, fileno, EV_WRITE);
     io->data = (void *)cnt;
     ev_io_start(ev_default_loop(0), io);
-    printf("Schedule write\n");
     return JS_TRUE;
 }
 
@@ -351,6 +342,9 @@ int main(int argc, const char *argv[]) {
     if (!spawn(rt, "servo.js"))
         return 1;
 
+    if (!spawn(rt, "servo.js"))
+        return 1;
+
     // *************************************************************
     while (runnables_outstanding) {
         while (runnables_outstanding) {
@@ -359,7 +353,7 @@ int main(int argc, const char *argv[]) {
             free(continuation);
 
             sandbox = JS_GetGlobalObject(runnable);
-            ok = JS_EvaluateScript(runnable, sandbox, "print('!', resume())", 20, "main", 0, &rval);
+            ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
             if (!ok) {
                 return 1;
             }
@@ -367,9 +361,7 @@ int main(int argc, const char *argv[]) {
 
             // *************************************************************
         }
-        printf("running\n");
         ev_run(loop, 0);
-        printf("ran\n");
     }
 
     /* Clean things up and shut down SpiderMonkey. */
