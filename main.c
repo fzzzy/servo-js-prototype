@@ -145,10 +145,13 @@ static void read_callback(EV_P_ ev_io *w, int revents) {
     buffer[amountread] = NULL;
     printf("buffer %s\n", buffer);
     jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(cx, buffer, amountread));
+    jsval *fd = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, w->fd, fd);
+    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_fd", fd);
     JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_data", &the_string);
-    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('recv', [_data])", 21, "main", 0, &rval);
+    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('recv', [_fd, _data])", 26, "main", 0, &rval);
 
-    
+    runnables[runnables_outstanding++] = cont;
 
     printf("readcallback\n");
     ev_io_stop(ev_default_loop(0), w);
@@ -299,7 +302,7 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     if (!JS_DefineFunctions(cx, global, servo_global_functions))
         return NULL;
 
-    JSScript *actormain = JS_CompileFile(cx, global, "/Users/donovan/Code/pavel.js/actormain.js");
+    JSScript *actormain = JS_CompileFile(cx, global, "actormain.js");
     if (!actormain)
         return NULL;
 
@@ -313,7 +316,7 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
 
     str = JS_ValueToString(cx, rval);
 
-    JSScript *domjs = JS_CompileFile(cx, global, "/Users/donovan/Code/dom.js/dom.js");
+    JSScript *domjs = JS_CompileFile(cx, global, "../dom.js/dom.js");
     if (!domjs)
         return NULL;
 
@@ -356,7 +359,7 @@ int main(int argc, const char *argv[]) {
             free(continuation);
 
             sandbox = JS_GetGlobalObject(runnable);
-            ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
+            ok = JS_EvaluateScript(runnable, sandbox, "print('!', resume())", 20, "main", 0, &rval);
             if (!ok) {
                 return 1;
             }
