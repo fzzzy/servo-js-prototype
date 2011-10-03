@@ -18,7 +18,7 @@
     let _intervals = {};
     let _connects = [];
     let _xhrs = {};
-    let _xhrid = 0;
+    let _xhrid = 1;
 
     function cast(pattern, message) {
         _mailbox.push([pattern, message]);
@@ -217,7 +217,7 @@
         this._response = "";
         this.responseText = "";
         this.responseXML = null;
-        this._id = XMLHttpRequest.prototype._id++;
+        this._id = _xhrid++;
         this._headers = [];
         this._responseHeaders = [];
     }
@@ -248,12 +248,13 @@
             }
             this._sock = new Socket(host, port);
             _xhrs[this._id] = this;
-            socket_connect(host, port, this._id);
+            this._fd = socket_connect(host, port, this._id);
             this._host = host;
             this._method = method;
             this._url = parts.url;
             this._user = user;
             this._pw = pw;
+            this.readyState = XMLHttpRequest.prototype.OPENED;
         },
         setRequestHeader: function setRequestHeader(header, value) {
             this._headers.push([header, value]);

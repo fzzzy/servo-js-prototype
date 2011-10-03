@@ -10,6 +10,7 @@
 typedef struct _continuation {
     JSContext * cx;
     jsval * data;
+    jsval * tag;
 } Continuation;
 
 static Continuation *runnables[4096];
@@ -69,10 +70,11 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     fileno = socket(PF_INET, SOCK_STREAM, 0);
     fcntl(fileno, F_SETFL, O_NONBLOCK);
 
-    while (connect(fileno, (struct sockaddr *)&address, sizeof(address)) == -1) {
-        if (errno == EISCONN) break;
-        sleep(0.01); // TODO don't block!
-        // actor_sleep(self, 0.01);
+    if (connect(fileno, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        if (errno != EINPROGRESS) {
+            JS_ReportError(cx, "Error connecting");
+            return JS_FALSE;
+        }
     }
 
     JS_SET_RVAL(cx, vp, INT_TO_JSVAL(fileno));
@@ -94,7 +96,7 @@ JSBool servo_close(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
-static void timer_callback (EV_P_ ev_timer *w, int revents) {
+static void timer_callback(EV_P_ ev_timer *w, int revents) {
     Continuation * cont = (Continuation *)w->data;
     jsval rval;
 
@@ -132,21 +134,25 @@ static void read_callback(EV_P_ ev_io *w, int revents) {
     Continuation * cont = (Continuation *)w->data;
     JSContext *cx = cont->cx;
     int32 howmuch;
+    int32 tag;
     jsval rval;
 
     JS_ValueToInt32(cx, *cont->data, &howmuch);
-    char * buffer = (char *)malloc(howmuch);
 
-    JS_RemoveValueRoot(cx, cont->data);
+    char * buffer = (char *)malloc(howmuch);
 
     uint32 amountread = recv(w->fd, buffer, howmuch, 0);
     buffer[amountread] = NULL;
     jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(cx, buffer, amountread));
     jsval *fd = (jsval *)malloc(sizeof(jsval));
     JS_NewNumberValue(cx, w->fd, fd);
+
     JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_fd", fd);
     JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_data", &the_string);
-    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('recv', [_fd, _data])", 26, "main", 0, &rval);
+    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_tag", cont->tag);
+    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('recv', [_fd, _data, _tag])", 32, "main", 0, &rval);
+
+    JS_RemoveValueRoot(cx, cont->data);
 
     runnables[runnables_outstanding++] = cont;
 
@@ -157,7 +163,9 @@ static void read_callback(EV_P_ ev_io *w, int revents) {
 JSBool servo_schedule_read(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
     int howmuch = 0;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uu", &fileno, &howmuch);
+    int tag = 0;
+    int result = JS_ConvertArguments(
+        cx, argc, JS_ARGV(cx, vp), "uu/u", &fileno, &howmuch, &tag);
     if (!result) {
         JS_ReportError(cx, "Invalid arguments: expected fileno, howmuch");
         return JS_FALSE;
@@ -167,6 +175,9 @@ JSBool servo_schedule_read(JSContext *cx, uintN argc, jsval *vp) {
     cnt->data = (jsval *)malloc(sizeof(jsval));
     JS_NewNumberValue(cx, howmuch, cnt->data);
     JS_AddValueRoot(cx, cnt->data);
+    cnt->tag = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, tag, cnt->tag);
+    JS_AddValueRoot(cx, cnt->tag);
 
     ev_io *io = (ev_io *)malloc(sizeof(ev_io));
     ev_io_init(io, read_callback, fileno, EV_READ);
@@ -182,27 +193,39 @@ static void write_callback(EV_P_ ev_io *w, int revents) {
     int size = JS_GetStringLength(to_write_str);
     char * to_write = JS_EncodeString(cx, to_write_str);
     int size_sent = send(w->fd, to_write, size, 0);
-    if (size_sent == size) {
+    if (size_sent == -1) {
+        printf("Error writing to fd %d (%d)\n", w->fd, errno);
+        ev_io_stop(ev_default_loop(0), w);
+        free(w);
+    } else if (size_sent == size) {
         jsval rval;
         jsval *fd = (jsval *)malloc(sizeof(jsval));
         JS_NewNumberValue(cx, w->fd, fd);
         JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_fd", fd);
-        int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('send', [_fd])", 19, "main", 0, &rval);
+        jsval *sent_js = (jsval *)malloc(sizeof(jsval));
+        JS_NewNumberValue(cx, size_sent, sent_js);
+        JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_sent", sent_js);
+        JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_tag", cont->tag);
+        int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
         runnables[runnables_outstanding++] = cont;
 
         ev_io_stop(ev_default_loop(0), w);
         free(w);
     } else {
-        printf("notallsent!\n");
+        printf("notallsent fail! %d %d\n", size, size_sent);
+        ev_io_stop(ev_default_loop(0), w);
+        free(w);
         // TODO really need to figure out a way to trigger this for testing.
-        cont->data = (jsval *)JS_NewStringCopyN(cx, to_write + size_sent, size - size_sent);
+        //cont->data = (jsval *)JS_NewStringCopyN(cx, to_write + size_sent, size - size_sent);
     }
 }
 
 JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
+    int tag = 0;
     JSString *data;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uS", &fileno, &data);
+
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uS/u", &fileno, &data, &tag);
     if (!result) {
         JS_ReportError(cx, "Invalid arguments: expected fileno, data");
         return JS_FALSE;
@@ -210,6 +233,10 @@ JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
     cnt->cx = cx;
     cnt->data = (jsval *)data;
+
+    cnt->tag = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, tag, cnt->tag);
+    JS_AddValueRoot(cx, cnt->tag);
 
     ev_io *io = (ev_io *)malloc(sizeof(ev_io));
     ev_io_init(io, write_callback, fileno, EV_WRITE);
