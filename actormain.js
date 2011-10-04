@@ -113,7 +113,6 @@
                 if (_pattern === undefined) {
                     _pattern = Any;
                 }
-                return _pattern;
             } else if (_next instanceof Result) {
                 // a value to pump into a generator
                 try {
@@ -147,7 +146,7 @@
             args.push(arguments[i]);
         }
         _timeouts[key] = [func, args];
-        schedule_timer(timeout, key);
+        schedule_timer(timeout / 1000.0, key);
     }
 
     function clearTimeout(key) {
@@ -297,6 +296,7 @@
             if (pattern === "wait") {
                 let func = _timeouts[data][0];
                 let args = _timeouts[data][1];
+                delete _timeouts[data];
                 try {
                     func.apply(null, args);
                 } catch (e) {
@@ -374,7 +374,7 @@
 
     function resume() {
         try {
-            return _actor_main();
+            _actor_main();
         } catch (e) {
             if (e instanceof StopIteration) {
                 return;
@@ -385,6 +385,10 @@
             print(e.stack);
         }
     }
+    globs.window.setTimeout = setTimeout;
+    globs.window.clearTimeout = clearTimeout;
+    globs.window.setInterval = setInterval;
+    globs.window.clearInterval = clearInterval;
     globs.setTimeout = setTimeout;
     globs.clearTimeout = clearTimeout;
     globs.setInterval = setInterval;

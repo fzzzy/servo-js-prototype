@@ -1,25 +1,30 @@
 
-let result = connect("127.0.0.1", 6000);
+let $ = window.jQuery;
 
-print("Opened socket", result);
-
-yield result.send("hello world");
-let echo = yield result.recv(4096);
-
-print("echo", echo);
-
-result.close();
-
-setTimeout(function(foo) {
-    print("timer!", foo);
-}, 0.1, "foo");
-
-let foo = new XMLHttpRequest();
-foo.onreadystatechange = function () {
-    if (this.readyState === 4) {
-        print(this.responseText);
-    }
+function cb() {
+    print("callback", document, document.body);
+    $("a").addClass("test");
+    $("a").each(function() {
+        print("hi", this.getAttribute('href'));
+    });
 }
 
-foo.open("GET", 'http://localhost/');
-foo.send();
+function mutation(evt) {
+    print("mutation", JSON.stringify(evt));
+}
+
+document.implementation.mozSetOutputMutationHandler(document, mutation);
+
+let xhr = new XMLHttpRequest();
+
+xhr.onreadystatechange = function() {
+    if (this.readyState === 4) {
+        window.parseHtmlDocument(this.responseText, document, cb, null);
+    }
+}
+ 
+print("JQUERY", window.jQuery);
+
+let url = "http://localhost:80/";
+xhr.open("GET", url);
+xhr.send("");

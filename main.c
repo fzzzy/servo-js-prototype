@@ -1,4 +1,6 @@
 #include "jsapi.h"
+//#include "jsdbgapi.h"
+//#include "jscntxt.h"
 #include "ev.h"
 #include <stdio.h>
 #include <sys/socket.h>
@@ -7,41 +9,42 @@
 #include <errno.h>
 #include <unistd.h>
 
+// ****************************************************
+// Managing the set of Actors that are ready to run
+// ****************************************************
+
+#define MAX_RUNNABLES_OUTSTANDING 4096
+#define RUNTIME_SIZE 8 * 1024 * 1024
+
 typedef struct _continuation {
     JSContext * cx;
     jsval * data;
     jsval * tag;
 } Continuation;
 
-static Continuation *runnables[4096];
+static Continuation *runnables[MAX_RUNNABLES_OUTSTANDING];
 static int runnables_outstanding = 0;
 
-static JSBool global_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags, JSObject **objp) {
-    JSBool resolved;
-
-    if (!JS_ResolveStandardClass(cx, obj, id, &resolved))
-        return JS_FALSE;
-    if (resolved) {
-        *objp = obj;
-        return JS_TRUE;
+JSBool schedule_actor(Continuation *cont) {
+    if (runnables_outstanding == MAX_RUNNABLES_OUTSTANDING) {
+      return JS_FALSE;
     }
+    runnables[runnables_outstanding++] = cont;
+
+    ev_break(ev_default_loop(0), EVBREAK_ONE);
     return JS_TRUE;
 }
 
-static JSClass global_class = {
-    "global", JSCLASS_NEW_RESOLVE | JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_PRIVATE,
-    JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
-    JS_EnumerateStub, (JSResolveOp)global_resolve, JS_ConvertStub, JS_FinalizeStub,
-    JSCLASS_NO_OPTIONAL_MEMBERS
-};
+// ****************************************************
+// api exposed to Actors:
+//  fileno = connect(host, port)
+//  close(fileno)
+//  schedule_timer(timeout, request_id)
+//  schedule_read(fileno, howmuch, request_id)
+//  schedule_write(fileno, towrite, request_id)
+// ****************************************************
 
-void report_error(JSContext *cx, const char *message, JSErrorReport *report) {
-    fprintf(
-        stderr, "%s@%u %s\n",
-        report->filename ? report->filename : "<no filename>",
-        (unsigned int) report->lineno, message);
-}
-
+// *** fileno = connect(host, port)
 JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     JSString *string;
     char host[256];
@@ -57,7 +60,6 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     JS_EncodeStringToBuffer(string, host, 256);
     host[JS_GetStringLength(string)] = NULL;
     hostrec = gethostbyname(host);
-
     if (!hostrec) {
         JS_ReportError(cx, "Bad host");
         return JS_FALSE;
@@ -70,17 +72,21 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     fileno = socket(PF_INET, SOCK_STREAM, 0);
     fcntl(fileno, F_SETFL, O_NONBLOCK);
 
-    if (connect(fileno, (struct sockaddr *)&address, sizeof(address)) == -1) {
-        if (errno != EINPROGRESS) {
-            JS_ReportError(cx, "Error connecting");
+    while (connect(fileno, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        if (errno == EISCONN || errno == EALREADY) {
+            break;
+        } else if (errno != EINPROGRESS) {
+            JS_ReportError(cx, "Error connecting %d", errno);
             return JS_FALSE;
         }
+        sleep(0.1);
     }
 
     JS_SET_RVAL(cx, vp, INT_TO_JSVAL(fileno));
     return JS_TRUE;
 }
 
+// close(fileno)
 JSBool servo_close(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
     int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "i", &fileno);
@@ -96,6 +102,7 @@ JSBool servo_close(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
+// schedule_timer(timeout, request_id)
 static void timer_callback(EV_P_ ev_timer *w, int revents) {
     Continuation * cont = (Continuation *)w->data;
     jsval rval;
@@ -104,7 +111,7 @@ static void timer_callback(EV_P_ ev_timer *w, int revents) {
     int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('wait', _data)", 19, "main", 0, &rval);
     JS_RemoveValueRoot(cont->cx, cont->data);
 
-    runnables[runnables_outstanding++] = cont;
+    schedule_actor(cont);
     free(w);
 }
 
@@ -130,6 +137,7 @@ JSBool servo_schedule_timer(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
+// schedule_read(fileno, howmuch, request_id)
 static void read_callback(EV_P_ ev_io *w, int revents) {
     Continuation * cont = (Continuation *)w->data;
     JSContext *cx = cont->cx;
@@ -154,7 +162,7 @@ static void read_callback(EV_P_ ev_io *w, int revents) {
 
     JS_RemoveValueRoot(cx, cont->data);
 
-    runnables[runnables_outstanding++] = cont;
+    schedule_actor(cont);
 
     ev_io_stop(ev_default_loop(0), w);
     free(w);
@@ -186,6 +194,7 @@ JSBool servo_schedule_read(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
+// schedule_write(fileno, towrite, request_id)
 static void write_callback(EV_P_ ev_io *w, int revents) {
     Continuation * cont = (Continuation *)w->data;
     JSContext *cx = cont->cx;
@@ -207,7 +216,8 @@ static void write_callback(EV_P_ ev_io *w, int revents) {
         JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_sent", sent_js);
         JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_tag", cont->tag);
         int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
-        runnables[runnables_outstanding++] = cont;
+        
+        schedule_actor(cont);
 
         ev_io_stop(ev_default_loop(0), w);
         free(w);
@@ -245,6 +255,36 @@ JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
+// ****************************************************
+// Boilerplate embedding stuff
+// ****************************************************
+
+static JSBool global_resolve(JSContext *cx, JSObject *obj, jsid id, uintN flags, JSObject **objp) {
+    JSBool resolved;
+
+    if (!JS_ResolveStandardClass(cx, obj, id, &resolved))
+        return JS_FALSE;
+    if (resolved) {
+        *objp = obj;
+        return JS_TRUE;
+    }
+    return JS_TRUE;
+}
+
+static JSClass global_class = {
+    "global", JSCLASS_NEW_RESOLVE | JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_PRIVATE,
+    JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
+    JS_EnumerateStub, (JSResolveOp)global_resolve, JS_ConvertStub, JS_FinalizeStub,
+    JSCLASS_NO_OPTIONAL_MEMBERS
+};
+
+void report_error(JSContext *cx, const char *message, JSErrorReport *report) {
+    fprintf(
+        stderr, "%s@%u %s\n",
+        report->filename ? report->filename : "<no filename>",
+        (unsigned int) report->lineno, message);
+}
+
 static JSBool
 Print(JSContext *cx, uintN argc, jsval *vp)
 {
@@ -264,11 +304,7 @@ Print(JSContext *cx, uintN argc, jsval *vp)
         printf("%s%s", i ? " " : "", bytes);
         JS_free(cx, bytes);
     }
-
     printf("\n");
-    //putc('\n');
-    //fflush(gOutFile);
-
     JS_SET_RVAL(cx, vp, JSVAL_VOID);
     return JS_TRUE;
 }
@@ -283,6 +319,21 @@ static JSFunctionSpec servo_global_functions[] = {
     JS_FS_END
 };
 
+/*
+JSTrapStatus SpewHook(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rval, void *closure) {
+    const char* filename = JS_GetScriptFilename(cx, script);
+    uintN lineno = JS_PCToLineNumber(cx, script, pc);
+
+    printf("%s %d\n", filename, lineno);
+
+    return JSTRAP_CONTINUE;
+}
+*/
+
+// ****************************************************
+// API for servo to start Actors.
+// ****************************************************
+
 JSContext * spawn(JSRuntime *rt, const char * filename) {
     JSContext *cx = JS_NewContext(rt, 8192);
     if (cx == NULL)
@@ -290,6 +341,8 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     JS_SetOptions(cx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
     JS_SetVersion(cx, JSVERSION_LATEST);
     JS_SetErrorReporter(cx, report_error);
+
+//    JS_SetInterrupt(cx->runtime, &SpewHook, NULL);
 
     JSObject  *global = JS_NewCompartmentAndGlobalObject(cx, &global_class, NULL);
     if (global == NULL)
@@ -320,6 +373,18 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     if (!JS_DefineFunctions(cx, global, servo_global_functions))
         return NULL;
 
+    JSObject *window = JS_NewObject(cx, NULL, NULL, NULL);
+    if (!window)
+        return NULL;
+    jsval window_object = OBJECT_TO_JSVAL(window);
+    JS_SetProperty(cx, global, "window", &window_object);
+
+    JSObject *navigator = JS_NewObject(cx, NULL, NULL, NULL);
+    if (!navigator)
+        return NULL;
+    jsval navigator_object = OBJECT_TO_JSVAL(navigator);
+    JS_SetProperty(cx, window, "navigator", &navigator_object);
+
     JSScript *actormain = JS_CompileFile(cx, global, "actormain.js");
     if (!actormain)
         return NULL;
@@ -332,8 +397,6 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     if (!ok)
         return NULL;
 
-    str = JS_ValueToString(cx, rval);
-
     JSScript *domjs = JS_CompileFile(cx, global, "../dom.js/dom.js");
     if (!domjs)
         return NULL;
@@ -341,15 +404,39 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     ok = JS_ExecuteScript(cx, global, domjs, &rval);
     if (!ok)
         return NULL;
+    ok = JS_EvaluateScript(cx, global, "document.write = function(){}", 29, "main", 0, &rval);
+    ok = JS_EvaluateScript(cx, global, "document.location = {href: 'http://example.com'}", 48, "main", 0, &rval);
+    ok = JS_EvaluateScript(cx, global, "window.navigator.userAgent = 'servo 0.1a'", 41, "main", 0, &rval);
+    ok = JS_EvaluateScript(cx, global, "window.document = document", 26, "main", 0, &rval);
 
-    str = JS_ValueToString(cx, rval);
+    JSScript *parser = JS_CompileFile(cx, global, "parser.js");
+    if (!parser)
+        return NULL;
 
+    ok = JS_ExecuteScript(cx, global, parser, &rval);
+    if (!ok)
+        return NULL;
+
+    JSScript *jquery = JS_CompileFile(cx, global, "jquery-1.6.4.js");
+    if (!parser)
+        return NULL;
+    ok = JS_ExecuteScript(cx, global, jquery, &rval);
+    if (!ok) {
+        printf("fail\n");
+        return NULL;
+    }
+    ok = JS_EvaluateScript(cx, global, "var event = document.createEvent('customevent'); event.initEvent('DOMContentLoaded', false, true); document.dispatchEvent(event); delete event; 1", 145, "main", 0, &rval);
     Continuation *cont = (Continuation *)malloc(sizeof(Continuation));
     cont->cx = cx;
     cont->data = NULL;
-    runnables[runnables_outstanding++] = cont;
+
+    schedule_actor(cont);
     return cx;
 }
+
+// Main servo program.
+// Read urls from command line arguments, and start one
+// servo.js actor per url.
 
 int main(int argc, const char *argv[]) {
     struct ev_loop *loop = ev_default_loop(0);
@@ -362,13 +449,11 @@ int main(int argc, const char *argv[]) {
     JSContext *runnable;
     Continuation *continuation;
 
-    JSRuntime *rt = JS_NewRuntime(8 * 1024 * 1024);
+    JSRuntime *rt = JS_NewRuntime(RUNTIME_SIZE);
     if (rt == NULL)
         return 1;
 
-    if (!spawn(rt, "servo.js"))
-        return 1;
-
+    // TODO loop over argv and cast a url to each actor.
     if (!spawn(rt, "servo.js"))
         return 1;
 
@@ -384,8 +469,6 @@ int main(int argc, const char *argv[]) {
             if (!ok) {
                 return 1;
             }
-            str = JS_ValueToString(runnable, rval);
-
             // *************************************************************
         }
         ev_run(loop, 0);
