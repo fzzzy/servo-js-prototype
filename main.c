@@ -72,16 +72,12 @@ JSBool servo_connect(JSContext *cx, uintN argc, jsval *vp) {
     fileno = socket(PF_INET, SOCK_STREAM, 0);
     fcntl(fileno, F_SETFL, O_NONBLOCK);
 
-    while (connect(fileno, (struct sockaddr *)&address, sizeof(address)) == -1) {
-        if (errno == EISCONN || errno == EALREADY) {
-            break;
-        } else if (errno != EINPROGRESS) {
+    if (connect(fileno, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        if (errno != EISCONN && errno != EALREADY && errno != EINPROGRESS) {
             JS_ReportError(cx, "Error connecting %d", errno);
             return JS_FALSE;
         }
-        sleep(0.1);
     }
-
     JS_SET_RVAL(cx, vp, INT_TO_JSVAL(fileno));
     return JS_TRUE;
 }
@@ -366,6 +362,10 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
 
     JSFunction * func = JS_CompileFunction(
         cx, global, "_main", 0, NULL, file_data, file_size + 17, filename, 0);
+    if (func == NULL) {
+        printf("null func\n");
+        return NULL;
+    }
 
     JS_SetGlobalObject(cx, global);
     if (!JS_InitStandardClasses(cx, global))
@@ -373,25 +373,22 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     if (!JS_DefineFunctions(cx, global, servo_global_functions))
         return NULL;
 
-    JSObject *window = JS_NewObject(cx, NULL, NULL, NULL);
-    if (!window)
-        return NULL;
-    jsval window_object = OBJECT_TO_JSVAL(window);
+    jsval window_object = OBJECT_TO_JSVAL(global);
     JS_SetProperty(cx, global, "window", &window_object);
 
     JSObject *navigator = JS_NewObject(cx, NULL, NULL, NULL);
     if (!navigator)
         return NULL;
     jsval navigator_object = OBJECT_TO_JSVAL(navigator);
-    JS_SetProperty(cx, window, "navigator", &navigator_object);
-
-    JSScript *actormain = JS_CompileFile(cx, global, "actormain.js");
-    if (!actormain)
-        return NULL;
+    JS_SetProperty(cx, global, "navigator", &navigator_object);
 
     jsval rval;
     JSString *str;
     JSBool ok;
+
+    JSScript *actormain = JS_CompileFile(cx, global, "actormain.js");
+    if (!actormain)
+        return NULL;
 
     ok = JS_ExecuteScript(cx, global, actormain, &rval);
     if (!ok)
@@ -405,7 +402,7 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
     if (!ok)
         return NULL;
     ok = JS_EvaluateScript(cx, global, "document.write = function(){}", 29, "main", 0, &rval);
-    ok = JS_EvaluateScript(cx, global, "document.location = {href: 'http://example.com'}", 48, "main", 0, &rval);
+    ok = JS_EvaluateScript(cx, global, "window.location = document.location = {search: '', protocol: 'file', href: 'http://example.com'}", 96, "main", 0, &rval);
     ok = JS_EvaluateScript(cx, global, "window.navigator.userAgent = 'servo 0.1a'", 41, "main", 0, &rval);
     ok = JS_EvaluateScript(cx, global, "window.document = document", 26, "main", 0, &rval);
 
@@ -418,14 +415,25 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
         return NULL;
 
     JSScript *jquery = JS_CompileFile(cx, global, "jquery-1.6.4.js");
-    if (!parser)
+    if (!jquery)
         return NULL;
     ok = JS_ExecuteScript(cx, global, jquery, &rval);
     if (!ok) {
         printf("fail\n");
         return NULL;
     }
+
+    JSScript *qunit = JS_CompileFile(cx, global, "qunit.js");
+    if (!qunit)
+        return NULL;
+    ok = JS_ExecuteScript(cx, global, qunit, &rval);
+    if (!ok) {
+        printf("fail\n");
+        return NULL;
+    }
+
     ok = JS_EvaluateScript(cx, global, "var event = document.createEvent('customevent'); event.initEvent('DOMContentLoaded', false, true); document.dispatchEvent(event); delete event; 1", 145, "main", 0, &rval);
+
     Continuation *cont = (Continuation *)malloc(sizeof(Continuation));
     cont->cx = cx;
     cont->data = NULL;
@@ -453,7 +461,7 @@ int main(int argc, const char *argv[]) {
     if (rt == NULL)
         return 1;
 
-    // TODO loop over argv and cast a url to each actor.
+    // TODO loop over argv, spawn for each and cast a url to each actor.
     if (!spawn(rt, "servo.js"))
         return 1;
 
