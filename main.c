@@ -330,7 +330,7 @@ JSTrapStatus SpewHook(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rv
 // API for servo to start Actors.
 // ****************************************************
 
-JSContext * spawn(JSRuntime *rt, const char * filename) {
+JSContext *spawn(JSRuntime *rt, const char * filename) {
     JSContext *cx = JS_NewContext(rt, 8192);
     if (cx == NULL)
         return NULL;
@@ -432,6 +432,19 @@ JSContext * spawn(JSRuntime *rt, const char * filename) {
         return NULL;
     }
 
+    // set up qunit for use from the command line
+    ok = JS_EvaluateScript(cx, global, "QUnit.init(); QUnit.config.blocking = false; QUnit.config.autorun = true; QUnit.config.updateRate = 0; QUnit.log = function(res, msg) { print(res ? 'PASS' : 'FAIL', msg === undefined ? '' : msg); }", 197, "main", 0, &rval);
+
+    JSScript *core = JS_CompileFile(cx, global, "core.js");
+    if (!core)
+        return NULL;
+    ok = JS_ExecuteScript(cx, global, core, &rval);
+    if (!ok) {
+        printf("fail\n");
+        return NULL;
+    }
+
+    // fire the document loaded event
     ok = JS_EvaluateScript(cx, global, "var event = document.createEvent('customevent'); event.initEvent('DOMContentLoaded', false, true); document.dispatchEvent(event); delete event; 1", 145, "main", 0, &rval);
 
     Continuation *cont = (Continuation *)malloc(sizeof(Continuation));
