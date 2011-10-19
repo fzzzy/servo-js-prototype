@@ -1,6 +1,4 @@
 #include "jsapi.h"
-//#include "jsdbgapi.h"
-//#include "jscntxt.h"
 #include "ev.h"
 #include <stdio.h>
 #include <sys/socket.h>
@@ -14,7 +12,7 @@
 // ****************************************************
 
 #define MAX_RUNNABLES_OUTSTANDING 4096
-#define RUNTIME_SIZE 8 * 1024 * 1024
+#define RUNTIME_SIZE 128 * 1024 * 1024
 
 typedef struct _continuation {
     JSContext * cx;
@@ -394,32 +392,30 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
     if (!ok)
         return NULL;
 
-    JSScript *domjs = JS_CompileFile(cx, global, "../dom.js/dom.js");
+    JSScript *domjs = JS_CompileFile(cx, global, "dom.js/dom.js");
     if (!domjs)
         return NULL;
 
     ok = JS_ExecuteScript(cx, global, domjs, &rval);
     if (!ok)
         return NULL;
-    ok = JS_EvaluateScript(cx, global, "document.write = function(){}", 29, "main", 0, &rval);
-    ok = JS_EvaluateScript(cx, global, "window.location = document.location = {search: '', protocol: 'file', href: 'http://example.com'}", 96, "main", 0, &rval);
-    ok = JS_EvaluateScript(cx, global, "window.navigator.userAgent = 'servo 0.1a'", 41, "main", 0, &rval);
-    ok = JS_EvaluateScript(cx, global, "window.document = document", 26, "main", 0, &rval);
 
-    JSScript *parser = JS_CompileFile(cx, global, "parser.js");
-    if (!parser)
+    JSScript *domstr = JS_CompileFile(cx, global, "dom.js/src/impl/domstr.js");
+    if (!domstr)
         return NULL;
 
-    ok = JS_ExecuteScript(cx, global, parser, &rval);
+    ok = JS_ExecuteScript(cx, global, domstr, &rval);
     if (!ok)
         return NULL;
 
-    JSScript *jquery = JS_CompileFile(cx, global, "jquery-1.6.4.js");
+    ok = JS_EvaluateScript(cx, global, "window.navigator.userAgent = 'servo 0.1a'", 41, "main", 0, &rval);
+
+/*    JSScript *jquery = JS_CompileFile(cx, global, "jquery-1.6.4.js");
     if (!jquery)
         return NULL;
     ok = JS_ExecuteScript(cx, global, jquery, &rval);
     if (!ok) {
-        printf("fail\n");
+        printf("fail!\n");
         return NULL;
     }
 
@@ -428,7 +424,7 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
         return NULL;
     ok = JS_ExecuteScript(cx, global, qunit, &rval);
     if (!ok) {
-        printf("fail\n");
+        printf("fail.\n");
         return NULL;
     }
 
@@ -446,6 +442,7 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
 
     // fire the document loaded event
     ok = JS_EvaluateScript(cx, global, "var event = document.createEvent('customevent'); event.initEvent('DOMContentLoaded', false, true); document.dispatchEvent(event); delete event; 1", 145, "main", 0, &rval);
+*/
 
     Continuation *cont = (Continuation *)malloc(sizeof(Continuation));
     cont->cx = cx;
@@ -474,9 +471,19 @@ int main(int argc, const char *argv[]) {
     if (rt == NULL)
         return 1;
 
-    // TODO loop over argv, spawn for each and cast a url to each actor.
-    if (!spawn(rt, "servo.js"))
-        return 1;
+    for (int i = 1; i < argc; i++) {
+        JSContext * new_actor = spawn(rt, "servo.js");
+        if (!new_actor)
+            return 1;
+
+        jsval url = STRING_TO_JSVAL(JS_NewStringCopyZ(new_actor, argv[i]));
+        JS_SetProperty(
+            new_actor, JS_GetGlobalObject(new_actor),
+            "_url", &url);
+        ok = JS_EvaluateScript(
+            new_actor, JS_GetGlobalObject(new_actor),
+            "cast('url', _url)", 17, "main", 0, &rval);
+    }
 
     // *************************************************************
     while (runnables_outstanding) {

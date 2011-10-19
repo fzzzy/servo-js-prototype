@@ -6,10 +6,13 @@ TARGET = servo
 
 INCLUDE = -Ijs/dist/include
 
-$(TARGET):
-	$(CXX) $(INCLUDE) -o $(TARGET) $(OBJS) main.c
 
 all:	$(TARGET)
+	cd dom.js && make
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+
+$(TARGET): main.c
+	$(CXX) $(INCLUDE) -o $(TARGET) $(OBJS) main.c
+
