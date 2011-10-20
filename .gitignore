@@ -1,5 +1,7 @@
 .DS_Store
-libev-4.04
-js
 servo
+deps/dom.js
+deps/libev-4.04
+deps/mozilla-central
+deps/jquery
 

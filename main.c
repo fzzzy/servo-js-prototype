@@ -482,6 +482,7 @@ int main(int argc, const char *argv[]) {
         while (runnables_outstanding) {
             continuation = runnables[--runnables_outstanding];
             runnable = continuation->cx;
+            // This contination was consumed, free it.
             free(continuation);
 
             sandbox = JS_GetGlobalObject(runnable);
@@ -489,6 +490,10 @@ int main(int argc, const char *argv[]) {
             if (!ok) {
                 return 1;
             }
+            if (rval == JSVAL_NULL) {
+                // The Actor has finished, can can destroy it's context.
+                JS_DestroyContext(runnable);
+			}
             // *************************************************************
         }
         ev_run(loop, 0);

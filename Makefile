@@ -2,6 +2,7 @@
 all:	deps/dom.js servo
 
 deps/dom.js:
+	mkdir -p deps
 	cd deps && git clone git://github.com/andreasgal/dom.js.git && cd dom.js && git submodule init && git submodule update && make
 
 deps/mozilla-central:
