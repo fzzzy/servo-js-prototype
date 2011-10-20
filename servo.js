@@ -14,10 +14,14 @@ function mutation(evt) {
 
     switch (domjsNodeStr.charAt(0)) {
       case 'T':
-        print(evt.nid, "Text", JSON.stringify(domjsNodeStr.substr(1).split(NULL)[0]));
+        print(evt.nid, "Text", JSON.stringify(
+            domjsNodeStr.substr(1).split(NULL)[0]).substr(1, foo.length - 1)
+        );
         break;
       case 'C':
-        print(evt.nid, "Comment node", JSON.stringify(domjsNodeStr.substr(1).split(NULL)[0]));
+        print(evt.nid, "Comment node", JSON.stringify(
+            domjsNodeStr.substr(1).split(NULL)[0])
+        );
         break;
       case 'H':
           // html node

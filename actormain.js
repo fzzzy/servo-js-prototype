@@ -325,7 +325,13 @@
                 }
             } else if (pattern === "recv") {
                 let xhr = _xhrs[data[2]];
-                xhr._response += data[1];
+                if (data[1].length) {
+                    xhr._response += data[1];
+                } else {
+                    if (!xhr._contentLength) {
+                        xhr._contentLength = xhr._response.length - xhr._bodyIndex;
+                    }
+                }
 //                xhr.responseText += data[1];
                 if (!xhr.statusText) {
                     let i = xhr._response.indexOf("\r\n\r\n");
@@ -369,6 +375,7 @@
                 } else {
                     xhr.readyState = XMLHttpRequest.prototype.LOADING;
                     xhr.onreadystatechange.apply(xhr);
+                    schedule_read(xhr._fd, 32768, xhr._id);
                 }
             }
         }
