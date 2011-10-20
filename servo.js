@@ -1,5 +1,4 @@
 
-
 function mutation(evt) {
     var domjsNodeStr = evt.child;
     if (domjsNodeStr === undefined) {

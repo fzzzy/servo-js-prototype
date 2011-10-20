@@ -120,7 +120,9 @@
                 } catch (e) {
                     if (e instanceof StopIteration) {
                         _gen_stack.pop();
-                        if (!_gen_stack.length) return;
+                        // If we're at the bottom of our generator stack,
+                        // tell the scheduler to kill this Actor.
+                        if (!_gen_stack.length) return null;
                     } else {
                         throw e;
                     }
@@ -374,7 +376,7 @@
 
     function resume() {
         try {
-            _actor_main();
+            return _actor_main();
         } catch (e) {
             if (e instanceof StopIteration) {
                 return;

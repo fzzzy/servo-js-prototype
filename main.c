@@ -392,19 +392,11 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
     if (!ok)
         return NULL;
 
-    JSScript *domjs = JS_CompileFile(cx, global, "dom.js/dom.js");
+    JSScript *domjs = JS_CompileFile(cx, global, "deps/dom.js/dom.js");
     if (!domjs)
         return NULL;
 
     ok = JS_ExecuteScript(cx, global, domjs, &rval);
-    if (!ok)
-        return NULL;
-
-    JSScript *domstr = JS_CompileFile(cx, global, "dom.js/src/impl/domstr.js");
-    if (!domstr)
-        return NULL;
-
-    ok = JS_ExecuteScript(cx, global, domstr, &rval);
     if (!ok)
         return NULL;
 
