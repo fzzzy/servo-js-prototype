@@ -15,7 +15,7 @@ function mutation(evt) {
     switch (domjsNodeStr.charAt(0)) {
       case 'T':
         print(evt.nid, "Text", JSON.stringify(
-            domjsNodeStr.substr(1).split(NULL)[0]).substr(1, foo.length - 1)
+            domjsNodeStr.substr(1).split(NULL)[0]).substr(1, domjsNodeStr.length - 2)
         );
         break;
       case 'C':

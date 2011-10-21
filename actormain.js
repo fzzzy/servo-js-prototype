@@ -1,5 +1,8 @@
 
+"use strict";
+
 (function(globs) {
+    let _err = print;
     let _main = globs._main;
     let schedule_read = globs.schedule_read;
     let schedule_write = globs.schedule_write;
@@ -79,6 +82,9 @@
     }
 
     function receive(pattern) {
+        if (!pattern) {
+            pattern = Any;
+        }
         return new SuspendUntil(pattern);
     }
 
@@ -110,9 +116,6 @@
                 }
             } else if (_next instanceof SuspendUntil) {
                 _pattern = _next._pattern;
-                if (_pattern === undefined) {
-                    _pattern = Any;
-                }
             } else if (_next instanceof Result) {
                 // a value to pump into a generator
                 try {
@@ -120,9 +123,9 @@
                 } catch (e) {
                     if (e instanceof StopIteration) {
                         _gen_stack.pop();
-                        // If we're at the bottom of our generator stack,
-                        // tell the scheduler to kill this Actor.
-                        if (!_gen_stack.length) return null;
+                        if (!_gen_stack.length) {
+                            return null;
+                        }
                     } else {
                         throw e;
                     }
@@ -132,10 +135,11 @@
                 _next = _next.next();
             } else if (_next === _sentinel) {
                 // Main script body has finished, now we run drain until all scheduled events have concluded
-                _gen_stack.push(drain());
-                _next = _gen_stack[_gen_stack.length - 1].next();
+                _gen_stack.pop()
+                _gen_stack.push(_drain());
+                _next = _gen_stack[0].next();
             } else {
-                print("Warning: Unknown event:", _next);
+                _err("Warning: Unknown event:", _next);
                 return;
             }
         }
@@ -162,8 +166,8 @@
         try {
             func.apply(window, args);
         } catch (e) {
-            print("Error in setInterval");
-            print(e, e.stack);
+            _err("Error in setInterval");
+            _err(e, e.stack);
             clearInterval(key);
         }
     }
@@ -180,35 +184,35 @@
     }
 
     function urlparse(url) {
-        let result = {};
+        let parsed = {};
         let netloc = '';
         let query = '';
         let fragment = '';
         let i = url.indexOf(':')
         if (i > 0) {
-           result.scheme = url.substring(0, i);
+           parsed.scheme = url.substring(0, i);
             url = url.substring(i + 1);
             i = url.indexOf('/', 2);
             if (i > 0) {
-                result.netloc = url.substring(2, i);
+                parsed.netloc = url.substring(2, i);
                 url = url.substring(i);
             }
         } else {
-            result.scheme = "TODO use relative"
-            result.netloc = "TODO use relative"
+            parsed.scheme = "TODO use relative"
+            parsed.netloc = "TODO use relative"
         }
         i = url.indexOf('#');
         if (i > 0) {
-            result.fragment = url.substring(i + 1)
+            parsed.fragment = url.substring(i + 1)
             url = url.substring(0, i);
         }
         i = url.indexOf('?');
         if (i > 0) {
-            result.query = url.substring(i + 1);
+            parsed.query = url.substring(i + 1);
             url = url.substring(0, i);
         }
-        result.url = url;
-        return result;
+        parsed.url = url;
+        return parsed;
     }
 
     function XMLHttpRequest() {
@@ -290,7 +294,7 @@
         }
     }
 
-    function drain() {
+    function _drain() {
         while (Object.keys(_timeouts).length || Object.keys(_xhrs).length) {
             let next = yield receive();
             let pattern = next[0];
@@ -302,9 +306,9 @@
                 try {
                     func.apply(null, args);
                 } catch (e) {
-                    print("Exception in timer:");
-                    print(e);
-                    print(e.stack);
+                    _err("Exception in timer:");
+                    _err(e);
+                    _err(e.stack);
                 }
             } else if (pattern === "connect") {
                 let fd = data[0];
@@ -373,9 +377,9 @@
                     xhr.onreadystatechange.apply(xhr);
                     delete _xhrs[xhr._id];
                 } else {
+                    schedule_read(xhr._fd, 32768, xhr._id);
                     xhr.readyState = XMLHttpRequest.prototype.LOADING;
                     xhr.onreadystatechange.apply(xhr);
-                    schedule_read(xhr._fd, 32768, xhr._id);
                 }
             }
         }
@@ -383,15 +387,15 @@
 
     function resume() {
         try {
-            return _actor_main();
+            let res2 = _actor_main();
         } catch (e) {
             if (e instanceof StopIteration) {
                 return;
             }
-            print('Error in Actor:');
+            _err('Error in Actor:');
             //print(_script);
-            print(e);
-            print(e.stack);
+            _err(e);
+            _err(e.stack);
         }
     }
     globs.window.setTimeout = setTimeout;
@@ -405,7 +409,6 @@
 
     globs.cast = cast;
     globs.resume = resume;
-    globs.drain = drain;
     globs.wait = wait;
     globs.receive = receive;
     globs.connect = connect;
