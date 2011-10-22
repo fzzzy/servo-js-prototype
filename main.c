@@ -15,7 +15,7 @@
 // todo move this to command line parameter
 #define NUM_THREADS 4
 // calculate somehow?
-#define RUNTIME_SIZE 128 * 1024 * 1024
+#define RUNTIME_SIZE 32 * 1024 * 1024
 
 // ****************************************************
 // Managing the set of Actors that are ready to run
@@ -111,13 +111,10 @@ int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
 
     Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
     cnt->cx = cx;
-    cnt->data = (jsval *)malloc(sizeof(jsval));
+    cnt->data = NULL;
     cnt->cast = cast_wait;
     cnt->intval = timeout;
     cnt->next = NULL;
-
-    JS_NewNumberValue(cx, timeout, cnt->data);
-    JS_AddValueRoot(cx, cnt->data);
 
     if (tag) {
         cnt->tag = (jsval *)malloc(sizeof(jsval));
@@ -134,7 +131,7 @@ int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
 }
 
 // ****************************************************
-// Callbacks from c into the actor scheduler.
+// Callbacks from libev into the actor scheduler.
 // ****************************************************
 
 static void timer_callback(EV_P_ ev_timer *w, int revents) {
@@ -360,19 +357,15 @@ JSTrapStatus SpewHook(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rv
 // API for servo to start Actors.
 // ****************************************************
 
-JSContext *spawn(JSRuntime *rt, const char * filename) {
-    pthread_mutex_lock(&actors_mutex);
-    actors_outstanding++;
-    pthread_mutex_unlock(&actors_mutex);
-
+JSContext *make_context(JSRuntime *rt) {
     JSContext *cx = JS_NewContext(rt, 8192);
     if (cx == NULL)
         return NULL;
 
-    JS_SetContextPrivate(cx, 0);
-
     JS_SetContextThread(cx);
     JS_BeginRequest(cx);
+
+    JS_SetContextPrivate(cx, NULL);
 
     JS_SetOptions(cx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
     JS_SetVersion(cx, JSVERSION_LATEST);
@@ -387,6 +380,27 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
         return NULL;
     if (!JS_DefineFunctions(cx, global, servo_global_functions))
         return NULL;
+
+    JS_EndRequest(cx);
+    JS_ClearContextThread(cx);
+
+    return cx;
+}
+
+JSContext *spawn(JSRuntime *rt, const char * filename) {
+    jsval rval;
+    JSString *str;
+    JSBool ok;
+
+    pthread_mutex_lock(&actors_mutex);
+    actors_outstanding++;
+    pthread_mutex_unlock(&actors_mutex);
+
+    JSContext * cx = make_context(rt);
+    JSObject  *global = JS_GetGlobalObject(cx);
+
+    JS_SetContextThread(cx);
+    JS_BeginRequest(cx);
 
     JSFunction * sentinel = JS_CompileFunction(
         cx, global, "_sentinel", 0, NULL, "null;", 5, "null", 0);
@@ -419,10 +433,6 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
         return NULL;
     jsval navigator_object = OBJECT_TO_JSVAL(navigator);
     JS_SetProperty(cx, global, "navigator", &navigator_object);
-
-    jsval rval;
-    JSString *str;
-    JSBool ok;
 
     JSScript *actormain = JS_CompileFile(cx, global, "actormain.js");
     if (!actormain)
@@ -518,15 +528,15 @@ void * thread_main(void * runtime_in) {
         sandbox = JS_GetGlobalObject(runnable);
 
         if (cast == cast_wait) {
-            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", data);
             if (tag) {
-                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
+                JS_SetProperty(runnable, sandbox, "_tag", tag);
+                int ok = JS_EvaluateScript(runnable, sandbox, "cast('wait', _tag)", 16, "main", 0, &rval);
+            } else {
+                int ok = JS_EvaluateScript(runnable, sandbox, "cast('wait')", 13, "main", 0, &rval);
             }
-            int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('wait', _data, _tag)", 23, "main", 0, &rval);
             if (!ok) {
                 printf("cast did not return ok?!\n");
             }
-            JS_RemoveValueRoot(runnable, data);
             if (tag) {
                 JS_RemoveValueRoot(runnable, tag);
             }
@@ -542,16 +552,16 @@ void * thread_main(void * runtime_in) {
             } else {
                 jsval *fd = (jsval *)malloc(sizeof(jsval));
                 JS_NewNumberValue(runnable, intval, fd);
-                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_fd", fd);
+                JS_SetProperty(runnable, sandbox, "_fd", fd);
                 jsval *sent_js = (jsval *)malloc(sizeof(jsval));
                 JS_NewNumberValue(runnable, size_sent, sent_js);
-                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_sent", sent_js);
+                JS_SetProperty(runnable,sandbox, "_sent", sent_js);
                 if (tag) {
-                    JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
-                    ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
+                    JS_SetProperty(runnable, sandbox, "_tag", tag);
+                    ok = JS_EvaluateScript(runnable, sandbox, "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
                     JS_RemoveValueRoot(runnable, tag);
                 } else {
-                    ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('send', [_fd, _sent])", 26, "main", 0, &rval);
+                    ok = JS_EvaluateScript(runnable, sandbox, "cast('send', [_fd, _sent])", 26, "main", 0, &rval);
                 }
                 if (!ok) {
                     printf("cast did not return ok?!\n");
@@ -570,21 +580,21 @@ void * thread_main(void * runtime_in) {
             jsval *fd = (jsval *)malloc(sizeof(jsval));
             JS_NewNumberValue(runnable, intval, fd);
 
-            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_fd", fd);
-            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", &the_string);
+            JS_SetProperty(runnable, sandbox, "_fd", fd);
+            JS_SetProperty(runnable, sandbox, "_data", &the_string);
             if (tag) {
-                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
-                ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('recv', [_fd, _data, _tag])", 32, "main", 0, &rval);
+                JS_SetProperty(runnable, sandbox, "_tag", tag);
+                ok = JS_EvaluateScript(runnable, sandbox, "cast('recv', [_fd, _data, _tag])", 32, "main", 0, &rval);
                 JS_RemoveValueRoot(runnable, tag);
             } else {
-                ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('recv', [_fd, _data])", 26, "main", 0, &rval);
+                ok = JS_EvaluateScript(runnable, sandbox, "cast('recv', [_fd, _data])", 26, "main", 0, &rval);
             }
             if (!ok) {
                 printf("cast did not return ok?!\n");
             }
         } else if (cast == cast_url) {
-            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", data);
-            int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('url', _data)", 18, "main", 0, &rval);
+            JS_SetProperty(runnable, sandbox, "_data", data);
+            int ok = JS_EvaluateScript(runnable, sandbox, "cast('url', _data)", 18, "main", 0, &rval);
             if (!ok) {
                 printf("cast did not return ok?!\n");
             }
@@ -637,23 +647,7 @@ int main(int argc, const char *argv[]) {
     JS_SetInterrupt(rt, &SpewHook, NULL);
 #endif
 
-    JSContext *cx = JS_NewContext(rt, 8192);
-    if (cx == NULL)
-        return NULL;
-
-    JS_SetOptions(cx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
-    JS_SetVersion(cx, JSVERSION_LATEST);
-    JS_SetErrorReporter(cx, report_error);
-
-    JSObject  *global = JS_NewCompartmentAndGlobalObject(cx, &global_class, NULL);
-    if (global == NULL)
-        return NULL;
-
-    JS_SetGlobalObject(cx, global);
-    if (!JS_InitStandardClasses(cx, global))
-        return NULL;
-    if (!JS_DefineFunctions(cx, global, servo_global_functions))
-        return NULL;
+    JSContext * cx = make_context(rt);
 
     cast_wait = (jsval *)malloc(sizeof(jsval));
     cast_send = (jsval *)malloc(sizeof(jsval));
