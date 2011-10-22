@@ -38,13 +38,13 @@ static int shutting_down = 0;
 static int actors_outstanding = 0;
 static pthread_mutex_t actors_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static Continuation *runnables[MAX_RUNNABLES_OUTSTANDING];
 static int runnables_outstanding = 0;
+static Continuation *runnables[MAX_RUNNABLES_OUTSTANDING];
 static pthread_mutex_t runnables_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t runnables_condition = PTHREAD_COND_INITIALIZER;
 
-static Continuation *schedule[MAX_SCHEDULE_OUTSTANDING];
 static int schedule_outstanding = 0;
+static Continuation *schedule[MAX_SCHEDULE_OUTSTANDING];
 static pthread_mutex_t schedule_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t schedule_condition = PTHREAD_COND_INITIALIZER;
 
@@ -82,6 +82,7 @@ JSBool schedule_cast(JSContext *cx, jsval * cast, jsval * data, jsval * tag) {
 int main_schedule_io(JSContext * cx, jsval * cast, jsval * data, jsval * tag, int fileno) {
     pthread_mutex_lock(&schedule_mutex);
     if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
+        // TODO block until space.
         pthread_mutex_unlock(&schedule_mutex);
         return JS_FALSE;
     }
@@ -103,15 +104,14 @@ int main_schedule_io(JSContext * cx, jsval * cast, jsval * data, jsval * tag, in
 int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
     pthread_mutex_lock(&schedule_mutex);
     if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
+        // TODO block until space.
         pthread_mutex_unlock(&schedule_mutex);
-        // TODO block until space
         return JS_FALSE;
     }
 
     Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
     cnt->cx = cx;
     cnt->data = (jsval *)malloc(sizeof(jsval));
-    cnt->tag = (jsval *)malloc(sizeof(jsval));
     cnt->cast = cast_wait;
     cnt->intval = timeout;
     cnt->next = NULL;
@@ -119,8 +119,13 @@ int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
     JS_NewNumberValue(cx, timeout, cnt->data);
     JS_AddValueRoot(cx, cnt->data);
 
-    JS_NewNumberValue(cx, tag, cnt->tag);
-    JS_AddValueRoot(cx, cnt->tag);
+    if (tag) {
+        cnt->tag = (jsval *)malloc(sizeof(jsval));
+        JS_NewNumberValue(cx, tag, cnt->tag);
+        JS_AddValueRoot(cx, cnt->tag);
+    } else {
+        cnt->tag = NULL;
+    }
 
     schedule[schedule_outstanding++] = cnt;
     pthread_cond_signal(&schedule_condition);
@@ -514,15 +519,23 @@ void * thread_main(void * runtime_in) {
 
         if (cast == cast_wait) {
             JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", data);
-            int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('wait', _data)", 19, "main", 0, &rval);
+            if (tag) {
+                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
+            }
+            int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('wait', _data, _tag)", 23, "main", 0, &rval);
             if (!ok) {
                 printf("cast did not return ok?!\n");
             }
-            JS_RemoveValueRoot(runnable, data);        
+            JS_RemoveValueRoot(runnable, data);
+            if (tag) {
+                JS_RemoveValueRoot(runnable, tag);
+            }
         } else if (cast == cast_send) {
             JSString *to_write_str = JSVAL_TO_STRING(*data);
             int size = JS_GetStringLength(to_write_str);
             char * to_write = JS_EncodeString(runnable, to_write_str);
+            JS_RemoveValueRoot(runnable, data);
+
             int size_sent = send(intval, to_write, size, 0);
             if (size_sent == -1) {
                 printf("Error writing to fd %d (%d)\n", intval, errno);
@@ -533,8 +546,13 @@ void * thread_main(void * runtime_in) {
                 jsval *sent_js = (jsval *)malloc(sizeof(jsval));
                 JS_NewNumberValue(runnable, size_sent, sent_js);
                 JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_sent", sent_js);
-                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
-                ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
+                if (tag) {
+                    JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
+                    ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
+                    JS_RemoveValueRoot(runnable, tag);
+                } else {
+                    ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('send', [_fd, _sent])", 26, "main", 0, &rval);
+                }
                 if (!ok) {
                     printf("cast did not return ok?!\n");
                 }
@@ -542,28 +560,28 @@ void * thread_main(void * runtime_in) {
         } else if (cast == cast_recv) {
             int32 howmuch;
             JS_ValueToInt32(runnable, *data, &howmuch);
-            char * buffer = (char *)malloc(howmuch);
+            JS_RemoveValueRoot(runnable, data);
 
+            char * buffer = (char *)malloc(howmuch);
             uint32 amountread = recv(intval, buffer, howmuch, 0);
             buffer[amountread] = NULL;
             jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(runnable, buffer, amountread));
+
             jsval *fd = (jsval *)malloc(sizeof(jsval));
             JS_NewNumberValue(runnable, intval, fd);
 
             JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_fd", fd);
             JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", &the_string);
             if (tag) {
-            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
+                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
                 ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('recv', [_fd, _data, _tag])", 32, "main", 0, &rval);
+                JS_RemoveValueRoot(runnable, tag);
             } else {
                 ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('recv', [_fd, _data])", 26, "main", 0, &rval);
             }
             if (!ok) {
                 printf("cast did not return ok?!\n");
             }
-
-            JS_RemoveValueRoot(runnable, data);
-            JS_RemoveValueRoot(runnable, tag);
         } else if (cast == cast_url) {
             JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", data);
             int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('url', _data)", 18, "main", 0, &rval);
