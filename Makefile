@@ -14,14 +14,16 @@ deps/libev-4.04:
 	cd deps/libev-4.04 && ./configure && make
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f main.o servo
 
 CXXFLAGS = -O2 -g -Wall -fmessage-length=0
 
-OBJS = main.o deps/mozilla-central/js/src/build-servo/libjs_static.a deps/libev-4.04/ev.o /usr/local/lib/libnspr4.a
+OBJS = deps/mozilla-central/js/src/build-servo/libjs_static.a deps/libev-4.04/ev.o /usr/local/lib/libnspr4.a
 
 INCLUDE = -Ideps/mozilla-central/js/src/build-servo/dist/include -Ideps/mozilla-central/js/src/build-servo
 
-servo: deps/mozilla-central deps/libev-4.04 main.c
+main.o: main.c
 	g++-4.2 -g -O -c $(INCLUDE) main.c
-	g++-4.2 -g -O -o servo $(OBJS)
+
+servo: main.o deps/mozilla-central deps/libev-4.04 $(OBJS)
+	g++-4.2 -g -O -o servo $(OBJS) main.o

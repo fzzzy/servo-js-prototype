@@ -10,18 +10,19 @@
 #include "ev.h"
 #include "jsapi.h"
 
+#define DEBUG_SPEW 0
+
+// todo move this to command line parameter
+#define NUM_THREADS 4
+// calculate somehow?
+#define RUNTIME_SIZE 128 * 1024 * 1024
+
 // ****************************************************
 // Managing the set of Actors that are ready to run
 // ****************************************************
 
-#define DEBUG_SPEW 0
-
-// todo move this to command line parameter
-#define NUM_THREADS 2
-
 #define MAX_RUNNABLES_OUTSTANDING 4096
 #define MAX_SCHEDULE_OUTSTANDING 4096
-#define RUNTIME_SIZE 128 * 1024 * 1024
 
 typedef struct _continuation {
     JSContext * cx;
@@ -44,13 +45,11 @@ static pthread_cond_t runnables_condition = PTHREAD_COND_INITIALIZER;
 
 static Continuation *schedule[MAX_SCHEDULE_OUTSTANDING];
 static int schedule_outstanding = 0;
-static ev_async schedule_signal;
 static pthread_mutex_t schedule_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t schedule_condition = PTHREAD_COND_INITIALIZER;
 
 static pthread_mutex_t reschedule_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static JSRuntime *rt = NULL;
 static jsval * cast_wait = NULL;
 static jsval * cast_send = NULL;
 static jsval * cast_recv = NULL;
@@ -59,6 +58,7 @@ static jsval * cast_url = NULL;
 JSBool schedule_actor(Continuation * cont) {
     pthread_mutex_lock(&runnables_mutex);
     if (runnables_outstanding == MAX_RUNNABLES_OUTSTANDING) {
+        // TODO block until space.
         pthread_mutex_unlock(&runnables_mutex);
         return JS_FALSE;
     }
@@ -98,13 +98,13 @@ int main_schedule_io(JSContext * cx, jsval * cast, jsval * data, jsval * tag, in
     pthread_cond_signal(&schedule_condition);
     pthread_mutex_unlock(&schedule_mutex);
     return 1;
-    // TODO send async signal to main thread
 }
 
 int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
     pthread_mutex_lock(&schedule_mutex);
     if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
         pthread_mutex_unlock(&schedule_mutex);
+        // TODO block until space
         return JS_FALSE;
     }
 
@@ -142,9 +142,9 @@ static void timer_callback(EV_P_ ev_timer *w, int revents) {
 static void io_callback(EV_P_ ev_io *w, int revents) {
     Continuation * cont = (Continuation *)w->data;
 
+    schedule_actor(cont);
     ev_io_stop(ev_default_loop(0), w);
     free(w);
-    schedule_actor(cont);
 }
 
 // ****************************************************
@@ -373,10 +373,6 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
     JS_SetVersion(cx, JSVERSION_LATEST);
     JS_SetErrorReporter(cx, report_error);
 
-#if DEBUG_SPEW
-    JS_SetInterrupt(cx->runtime, &SpewHook, NULL);
-#endif
-
     JSObject  *global = JS_NewCompartmentAndGlobalObject(cx, &global_class, NULL);
     if (global == NULL)
         return NULL;
@@ -469,13 +465,18 @@ void * thread_main(void * runtime_in) {
         if (shutting_down) {
             return 0;
         }
+
+        // ***************
+        // *** Locate Actor
         pthread_mutex_lock(&runnables_mutex);
         if (!runnables_outstanding) {
             pthread_cond_wait(&runnables_condition, &runnables_mutex);
             pthread_mutex_unlock(&runnables_mutex);
+            // Check to see if now shutting down.
             continue;
         }
         continuation = runnables[--runnables_outstanding];
+
         runnable = continuation->cx;
         data = continuation->data;
         tag = continuation->tag;
@@ -505,6 +506,8 @@ void * thread_main(void * runtime_in) {
         JS_BeginRequest(runnable);
 
         pthread_mutex_unlock(&runnables_mutex);
+        // *** Locate Actor
+        // ***************
 
         // *************************************************************
         sandbox = JS_GetGlobalObject(runnable);
@@ -585,15 +588,14 @@ void * thread_main(void * runtime_in) {
         pthread_mutex_unlock(&reschedule_mutex);
 
         free(continuation);
+
         if (JSVAL_IS_NULL(rval)) {
-            // The Actor has finished, can can destroy it's context.
+            // The Actor has finished, can destroy it's context.
             pthread_mutex_lock(&actors_mutex);
             JS_DestroyContext(runnable);
             actors_outstanding--;
             if (!actors_outstanding) {
-                // TODO signal the async signal
                 pthread_cond_signal(&schedule_condition);
-                pthread_mutex_unlock(&schedule_mutex);
             }
             pthread_mutex_unlock(&actors_mutex);
         }
@@ -609,9 +611,13 @@ int main(int argc, const char *argv[]) {
     int ok;
     pthread_t threads[NUM_THREADS];
     struct ev_loop * loop = ev_default_loop(0); 
-    rt = JS_NewRuntime(RUNTIME_SIZE);
+    JSRuntime *rt = JS_NewRuntime(RUNTIME_SIZE);
     if (rt == NULL)
         return 1;
+
+#if DEBUG_SPEW
+    JS_SetInterrupt(rt, &SpewHook, NULL);
+#endif
 
     JSContext *cx = JS_NewContext(rt, 8192);
     if (cx == NULL)
@@ -620,10 +626,6 @@ int main(int argc, const char *argv[]) {
     JS_SetOptions(cx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
     JS_SetVersion(cx, JSVERSION_LATEST);
     JS_SetErrorReporter(cx, report_error);
-
-#if DEBUG_SPEW
-    JS_SetInterrupt(cx->runtime, &SpewHook, NULL);
-#endif
 
     JSObject  *global = JS_NewCompartmentAndGlobalObject(cx, &global_class, NULL);
     if (global == NULL)
@@ -659,6 +661,15 @@ int main(int argc, const char *argv[]) {
             return 1;
         
         jsval urlstr = STRING_TO_JSVAL(JS_NewStringCopyZ(new_actor, argv[i]));
+        JS_AddValueRoot(cx, &urlstr);
+        schedule_cast(new_actor, cast_url, &urlstr, NULL);
+    }
+    if (argc == 1) {
+        JSContext * new_actor = spawn(rt, "servo.js");
+        if (!new_actor)
+            return 1;
+        
+        jsval urlstr = STRING_TO_JSVAL(JS_NewStringCopyZ(new_actor, "http://localhost/"));
         JS_AddValueRoot(cx, &urlstr);
         schedule_cast(new_actor, cast_url, &urlstr, NULL);
     }
