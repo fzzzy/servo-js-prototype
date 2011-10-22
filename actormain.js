@@ -152,7 +152,7 @@
             args.push(arguments[i]);
         }
         _timeouts[key] = [func, args];
-        schedule_timer(timeout / 1000.0, key);
+        schedule_timer(timeout, key);
     }
 
     function clearTimeout(key) {
@@ -332,15 +332,15 @@
                 if (data[1].length) {
                     xhr._response += data[1];
                 } else {
+                    print("got an empty recv");
                     if (!xhr._contentLength) {
                         xhr._contentLength = xhr._response.length - xhr._bodyIndex;
                     }
                 }
-//                xhr.responseText += data[1];
                 if (!xhr.statusText) {
                     let i = xhr._response.indexOf("\r\n\r\n");
-                    xhr._bodyIndex = i + 4;
                     if (i > 0) {
+                        xhr._bodyIndex = i + 4;
                         let j = xhr._response.indexOf("\r\n");
                         let parts = xhr._response.substring(0, j).split(' ');
                         xhr.status = parseInt(parts[1]);
@@ -387,7 +387,7 @@
 
     function resume() {
         try {
-            let res2 = _actor_main();
+           return _actor_main();
         } catch (e) {
             if (e instanceof StopIteration) {
                 return;

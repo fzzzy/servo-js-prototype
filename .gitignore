@@ -4,4 +4,4 @@ deps/dom.js
 deps/libev-4.04
 deps/mozilla-central
 deps/jquery
-
+main.o

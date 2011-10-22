@@ -1,36 +1,150 @@
-#include "jsapi.h"
-#include "ev.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/socket.h>
-#include <netdb.h>
-#include <fcntl.h>
-#include <errno.h>
 #include <unistd.h>
+
+#include "ev.h"
+#include "jsapi.h"
 
 // ****************************************************
 // Managing the set of Actors that are ready to run
 // ****************************************************
 
+#define DEBUG_SPEW 0
+
+// todo move this to command line parameter
+#define NUM_THREADS 2
+
 #define MAX_RUNNABLES_OUTSTANDING 4096
+#define MAX_SCHEDULE_OUTSTANDING 4096
 #define RUNTIME_SIZE 128 * 1024 * 1024
 
 typedef struct _continuation {
     JSContext * cx;
     jsval * data;
     jsval * tag;
+    jsval * cast;
+    uint32 intval; // how much to read, or how much was written, or how long to wait
+    struct _continuation * next; // the next chained continuation for this context
 } Continuation;
+
+static int shutting_down = 0;
+
+static int actors_outstanding = 0;
+static pthread_mutex_t actors_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static Continuation *runnables[MAX_RUNNABLES_OUTSTANDING];
 static int runnables_outstanding = 0;
+static pthread_mutex_t runnables_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t runnables_condition = PTHREAD_COND_INITIALIZER;
 
-JSBool schedule_actor(Continuation *cont) {
+static Continuation *schedule[MAX_SCHEDULE_OUTSTANDING];
+static int schedule_outstanding = 0;
+static ev_async schedule_signal;
+static pthread_mutex_t schedule_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t schedule_condition = PTHREAD_COND_INITIALIZER;
+
+static pthread_mutex_t reschedule_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static JSRuntime *rt = NULL;
+static jsval * cast_wait = NULL;
+static jsval * cast_send = NULL;
+static jsval * cast_recv = NULL;
+static jsval * cast_url = NULL;
+
+JSBool schedule_actor(Continuation * cont) {
+    pthread_mutex_lock(&runnables_mutex);
     if (runnables_outstanding == MAX_RUNNABLES_OUTSTANDING) {
-      return JS_FALSE;
+        pthread_mutex_unlock(&runnables_mutex);
+        return JS_FALSE;
     }
     runnables[runnables_outstanding++] = cont;
-
-    ev_break(ev_default_loop(0), EVBREAK_ONE);
+    pthread_cond_signal(&runnables_condition);
+    pthread_mutex_unlock(&runnables_mutex);
     return JS_TRUE;
+}
+
+JSBool schedule_cast(JSContext *cx, jsval * cast, jsval * data, jsval * tag) {
+    Continuation * cont = (Continuation *)malloc(sizeof(Continuation));
+    cont->cx = cx;
+    cont->cast = cast;
+    cont->data = data;
+    cont->tag = tag;
+    cont->intval = 0;
+    cont->next = NULL;
+    return schedule_actor(cont);
+}
+
+int main_schedule_io(JSContext * cx, jsval * cast, jsval * data, jsval * tag, int fileno) {
+    pthread_mutex_lock(&schedule_mutex);
+    if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
+        pthread_mutex_unlock(&schedule_mutex);
+        return JS_FALSE;
+    }
+
+    Continuation * cont = (Continuation *)malloc(sizeof(Continuation));
+    cont->cx = cx;
+    cont->data = data;
+    cont->tag = tag;
+    cont->cast = cast;
+    cont->intval = fileno;
+    cont->next = NULL;
+
+    schedule[schedule_outstanding++] = cont;
+    pthread_cond_signal(&schedule_condition);
+    pthread_mutex_unlock(&schedule_mutex);
+    return 1;
+    // TODO send async signal to main thread
+}
+
+int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
+    pthread_mutex_lock(&schedule_mutex);
+    if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
+        pthread_mutex_unlock(&schedule_mutex);
+        return JS_FALSE;
+    }
+
+    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
+    cnt->cx = cx;
+    cnt->data = (jsval *)malloc(sizeof(jsval));
+    cnt->tag = (jsval *)malloc(sizeof(jsval));
+    cnt->cast = cast_wait;
+    cnt->intval = timeout;
+    cnt->next = NULL;
+
+    JS_NewNumberValue(cx, timeout, cnt->data);
+    JS_AddValueRoot(cx, cnt->data);
+
+    JS_NewNumberValue(cx, tag, cnt->tag);
+    JS_AddValueRoot(cx, cnt->tag);
+
+    schedule[schedule_outstanding++] = cnt;
+    pthread_cond_signal(&schedule_condition);
+    pthread_mutex_unlock(&schedule_mutex);
+    return 1;
+}
+
+// ****************************************************
+// Callbacks from c into the actor scheduler.
+// ****************************************************
+
+static void timer_callback(EV_P_ ev_timer *w, int revents) {
+    Continuation * cont = (Continuation *)w->data;
+
+    schedule_actor(cont);
+    free(w);
+}
+
+static void io_callback(EV_P_ ev_io *w, int revents) {
+    Continuation * cont = (Continuation *)w->data;
+
+    ev_io_stop(ev_default_loop(0), w);
+    free(w);
+    schedule_actor(cont);
 }
 
 // ****************************************************
@@ -85,167 +199,80 @@ JSBool servo_close(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
     int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "i", &fileno);
     if (!result) {
-        JS_ReportError(cx, "Invalid arguments to close. Expected fileno");
+        JS_ReportError(cx, "Invalid arguments to close. Expected fileno\n");
         return JS_FALSE;
     }
     result = close(fileno);
     if (result == -1) {
-        JS_ReportError(cx, "Close failed");
+        JS_ReportError(cx, "Close failed\n");
         return JS_FALSE;    
     }
     return JS_TRUE;
 }
 
 // schedule_timer(timeout, request_id)
-static void timer_callback(EV_P_ ev_timer *w, int revents) {
-    Continuation * cont = (Continuation *)w->data;
-    jsval rval;
-
-    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_data", cont->data);
-    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('wait', _data)", 19, "main", 0, &rval);
-    JS_RemoveValueRoot(cont->cx, cont->data);
-
-    schedule_actor(cont);
-    free(w);
-}
-
 JSBool servo_schedule_timer(JSContext *cx, uintN argc, jsval *vp) {
-    jsdouble timeout = 0.1;
-    jsdouble raw;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "dd", &timeout, &raw);
+    uint32 timeout;
+    uint32 tag;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uu", &timeout, &tag);
     if (!result) {
-        JS_ReportError(cx, "Invalid timeout");
+        JS_ReportError(cx, "Invalid timeout\n");
         return JS_FALSE;
     }
 
-    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
-    cnt->cx = cx;
-    cnt->data = (jsval *)malloc(sizeof(jsval));
-    JS_NewNumberValue(cx, raw, cnt->data);
-    JS_AddValueRoot(cx, cnt->data);
+    main_schedule_timer(cx, timeout, tag);
 
-    ev_timer *timer = (ev_timer *)malloc(sizeof(ev_timer));
-    ev_timer_init(timer, timer_callback, timeout, 0.);
-    timer->data = (void *)cnt;
-    ev_timer_start(ev_default_loop(0), timer);
     return JS_TRUE;
 }
 
 // schedule_read(fileno, howmuch, request_id)
-static void read_callback(EV_P_ ev_io *w, int revents) {
-    Continuation * cont = (Continuation *)w->data;
-    JSContext *cx = cont->cx;
-    int32 howmuch;
-    int32 tag;
-    jsval rval;
-
-    JS_ValueToInt32(cx, *cont->data, &howmuch);
-
-    char * buffer = (char *)malloc(howmuch);
-
-    uint32 amountread = recv(w->fd, buffer, howmuch, 0);
-    buffer[amountread] = NULL;
-    jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(cx, buffer, amountread));
-    jsval *fd = (jsval *)malloc(sizeof(jsval));
-    JS_NewNumberValue(cx, w->fd, fd);
-
-    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_fd", fd);
-    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_data", &the_string);
-    JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_tag", cont->tag);
-    int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('recv', [_fd, _data, _tag])", 32, "main", 0, &rval);
-
-    JS_RemoveValueRoot(cx, cont->data);
-
-    schedule_actor(cont);
-
-    ev_io_stop(ev_default_loop(0), w);
-    free(w);
-}
-
 JSBool servo_schedule_read(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
     int howmuch = 0;
     int tag = 0;
+
     int result = JS_ConvertArguments(
         cx, argc, JS_ARGV(cx, vp), "uu/u", &fileno, &howmuch, &tag);
     if (!result) {
         JS_ReportError(cx, "Invalid arguments: expected fileno, howmuch");
         return JS_FALSE;
     }
-    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
-    cnt->cx = cx;
-    cnt->data = (jsval *)malloc(sizeof(jsval));
-    JS_NewNumberValue(cx, howmuch, cnt->data);
-    JS_AddValueRoot(cx, cnt->data);
-    cnt->tag = (jsval *)malloc(sizeof(jsval));
-    JS_NewNumberValue(cx, tag, cnt->tag);
-    JS_AddValueRoot(cx, cnt->tag);
 
-    ev_io *io = (ev_io *)malloc(sizeof(ev_io));
-    ev_io_init(io, read_callback, fileno, EV_READ);
-    io->data = (void *)cnt;
-    ev_io_start(ev_default_loop(0), io);
+    jsval * howmuchval = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, howmuch, howmuchval);
+    JS_AddValueRoot(cx, howmuchval);
+
+    jsval * tagval = (jsval *)malloc(sizeof(jsval));
+    JS_NewNumberValue(cx, tag, tagval);
+    JS_AddValueRoot(cx, tagval);
+
+    main_schedule_io(cx, cast_recv, howmuchval, tagval, (uint32)fileno);
+
     return JS_TRUE;
 }
 
 // schedule_write(fileno, towrite, request_id)
-static void write_callback(EV_P_ ev_io *w, int revents) {
-    Continuation * cont = (Continuation *)w->data;
-    JSContext *cx = cont->cx;
-    JSString *to_write_str = (JSString *)cont->data;
-    int size = JS_GetStringLength(to_write_str);
-    char * to_write = JS_EncodeString(cx, to_write_str);
-    int size_sent = send(w->fd, to_write, size, 0);
-    if (size_sent == -1) {
-        printf("Error writing to fd %d (%d)\n", w->fd, errno);
-        ev_io_stop(ev_default_loop(0), w);
-        free(w);
-    } else if (size_sent == size) {
-        jsval rval;
-        jsval *fd = (jsval *)malloc(sizeof(jsval));
-        JS_NewNumberValue(cx, w->fd, fd);
-        JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_fd", fd);
-        jsval *sent_js = (jsval *)malloc(sizeof(jsval));
-        JS_NewNumberValue(cx, size_sent, sent_js);
-        JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_sent", sent_js);
-        JS_SetProperty(cont->cx, JS_GetGlobalObject(cont->cx), "_tag", cont->tag);
-        int ok = JS_EvaluateScript(cont->cx, JS_GetGlobalObject(cont->cx), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
-        
-        schedule_actor(cont);
-
-        ev_io_stop(ev_default_loop(0), w);
-        free(w);
-    } else {
-        printf("notallsent fail! %d %d\n", size, size_sent);
-        ev_io_stop(ev_default_loop(0), w);
-        free(w);
-        // TODO really need to figure out a way to trigger this for testing.
-        //cont->data = (jsval *)JS_NewStringCopyN(cx, to_write + size_sent, size - size_sent);
-    }
-}
-
 JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     int fileno = 0;
-    int tag = 0;
     JSString *data;
+    int tag = 0;
 
     int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "uS/u", &fileno, &data, &tag);
     if (!result) {
         JS_ReportError(cx, "Invalid arguments: expected fileno, data");
         return JS_FALSE;
     }
-    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
-    cnt->cx = cx;
-    cnt->data = (jsval *)data;
 
-    cnt->tag = (jsval *)malloc(sizeof(jsval));
-    JS_NewNumberValue(cx, tag, cnt->tag);
-    JS_AddValueRoot(cx, cnt->tag);
+    jsval * tagval = (jsval *)malloc(sizeof(tagval));
+    JS_NewNumberValue(cx, tag, tagval);
+    JS_AddValueRoot(cx, tagval);
 
-    ev_io *io = (ev_io *)malloc(sizeof(ev_io));
-    ev_io_init(io, write_callback, fileno, EV_WRITE);
-    io->data = (void *)cnt;
-    ev_io_start(ev_default_loop(0), io);
+    jsval * dataval = (jsval *)malloc(sizeof(jsval));
+    *dataval = STRING_TO_JSVAL(data);
+    JS_AddValueRoot(cx, dataval);
+
+    main_schedule_io(cx, cast_send, dataval, tagval, (uint32)fileno);
+
     return JS_TRUE;
 }
 
@@ -280,7 +307,7 @@ void report_error(JSContext *cx, const char *message, JSErrorReport *report) {
 }
 
 static JSBool
-Print(JSContext *cx, uintN argc, jsval *vp)
+servo_print(JSContext *cx, uintN argc, jsval *vp)
 {
     jsval *argv;
     uintN i;
@@ -309,11 +336,11 @@ static JSFunctionSpec servo_global_functions[] = {
     JS_FS("schedule_timer", servo_schedule_timer, 1, 0),
     JS_FS("schedule_read", servo_schedule_read, 1, 0),
     JS_FS("schedule_write", servo_schedule_write, 1, 0),
-    JS_FN("print", Print, 0, 0),
+    JS_FN("print", servo_print, 0, 0),
     JS_FS_END
 };
 
-/*
+#if DEBUG_SPEW
 JSTrapStatus SpewHook(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rval, void *closure) {
     const char* filename = JS_GetScriptFilename(cx, script);
     uintN lineno = JS_PCToLineNumber(cx, script, pc);
@@ -322,24 +349,42 @@ JSTrapStatus SpewHook(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rv
 
     return JSTRAP_CONTINUE;
 }
-*/
+#endif
 
 // ****************************************************
 // API for servo to start Actors.
 // ****************************************************
 
 JSContext *spawn(JSRuntime *rt, const char * filename) {
+    pthread_mutex_lock(&actors_mutex);
+    actors_outstanding++;
+    pthread_mutex_unlock(&actors_mutex);
+
     JSContext *cx = JS_NewContext(rt, 8192);
     if (cx == NULL)
         return NULL;
+
+    JS_SetContextPrivate(cx, 0);
+
+    JS_SetContextThread(cx);
+    JS_BeginRequest(cx);
+
     JS_SetOptions(cx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
     JS_SetVersion(cx, JSVERSION_LATEST);
     JS_SetErrorReporter(cx, report_error);
 
-//    JS_SetInterrupt(cx->runtime, &SpewHook, NULL);
+#if DEBUG_SPEW
+    JS_SetInterrupt(cx->runtime, &SpewHook, NULL);
+#endif
 
     JSObject  *global = JS_NewCompartmentAndGlobalObject(cx, &global_class, NULL);
     if (global == NULL)
+        return NULL;
+
+    JS_SetGlobalObject(cx, global);
+    if (!JS_InitStandardClasses(cx, global))
+        return NULL;
+    if (!JS_DefineFunctions(cx, global, servo_global_functions))
         return NULL;
 
     JSFunction * sentinel = JS_CompileFunction(
@@ -364,12 +409,6 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
         printf("null func\n");
         return NULL;
     }
-
-    JS_SetGlobalObject(cx, global);
-    if (!JS_InitStandardClasses(cx, global))
-        return NULL;
-    if (!JS_DefineFunctions(cx, global, servo_global_functions))
-        return NULL;
 
     jsval window_object = OBJECT_TO_JSVAL(global);
     JS_SetProperty(cx, global, "window", &window_object);
@@ -402,54 +441,16 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
 
     ok = JS_EvaluateScript(cx, global, "window.navigator.userAgent = 'servo 0.1a'", 41, "main", 0, &rval);
 
-/*    JSScript *jquery = JS_CompileFile(cx, global, "jquery-1.6.4.js");
-    if (!jquery)
-        return NULL;
-    ok = JS_ExecuteScript(cx, global, jquery, &rval);
-    if (!ok) {
-        printf("fail!\n");
-        return NULL;
-    }
+    JS_EndRequest(cx);
+    JS_ClearContextThread(cx);
 
-    JSScript *qunit = JS_CompileFile(cx, global, "qunit.js");
-    if (!qunit)
-        return NULL;
-    ok = JS_ExecuteScript(cx, global, qunit, &rval);
-    if (!ok) {
-        printf("fail.\n");
-        return NULL;
-    }
-
-    // set up qunit for use from the command line
-    ok = JS_EvaluateScript(cx, global, "QUnit.init(); QUnit.config.blocking = false; QUnit.config.autorun = true; QUnit.config.updateRate = 0; QUnit.log = function(res, msg) { print(res ? 'PASS' : 'FAIL', msg === undefined ? '' : msg); }", 197, "main", 0, &rval);
-
-    JSScript *core = JS_CompileFile(cx, global, "core.js");
-    if (!core)
-        return NULL;
-    ok = JS_ExecuteScript(cx, global, core, &rval);
-    if (!ok) {
-        printf("fail\n");
-        return NULL;
-    }
-
-    // fire the document loaded event
-    ok = JS_EvaluateScript(cx, global, "var event = document.createEvent('customevent'); event.initEvent('DOMContentLoaded', false, true); document.dispatchEvent(event); delete event; 1", 145, "main", 0, &rval);
-*/
-
-    Continuation *cont = (Continuation *)malloc(sizeof(Continuation));
-    cont->cx = cx;
-    cont->data = NULL;
-
-    schedule_actor(cont);
+    schedule_cast(cx, NULL, NULL, NULL);
     return cx;
 }
 
-// Main servo program.
-// Read urls from command line arguments, and start one
-// servo.js actor per url.
-
-int main(int argc, const char *argv[]) {
-    struct ev_loop *loop = ev_default_loop(0);
+// Main actor dispatcher.
+void * thread_main(void * runtime_in) {
+    JSRuntime *rt = (JSRuntime *)runtime_in;
 
     jsval rval;
     JSString *str;
@@ -459,48 +460,268 @@ int main(int argc, const char *argv[]) {
     JSContext *runnable;
     Continuation *continuation;
 
-    JSRuntime *rt = JS_NewRuntime(RUNTIME_SIZE);
+    jsval * data;
+    jsval * tag;
+    jsval * cast;
+    uint32 intval;
+
+    while (1) {
+        if (shutting_down) {
+            return 0;
+        }
+        pthread_mutex_lock(&runnables_mutex);
+        if (!runnables_outstanding) {
+            pthread_cond_wait(&runnables_condition, &runnables_mutex);
+            pthread_mutex_unlock(&runnables_mutex);
+            continue;
+        }
+        continuation = runnables[--runnables_outstanding];
+        runnable = continuation->cx;
+        data = continuation->data;
+        tag = continuation->tag;
+        cast = continuation->cast;
+        intval = continuation->intval;
+
+        // ***************
+        // *** Reschedule
+        pthread_mutex_lock(&reschedule_mutex);
+        if (JS_GetContextThread(runnable)) {
+            Continuation * resched = (Continuation *)JS_GetContextPrivate(runnable);
+            while (resched->next) {
+                resched = resched->next;
+            }
+            resched->next = continuation;
+            pthread_mutex_unlock(&reschedule_mutex);
+            pthread_mutex_unlock(&runnables_mutex);
+            continue;
+        }
+
+        JS_SetContextPrivate(runnable, (void *)continuation);
+        pthread_mutex_unlock(&reschedule_mutex);
+        // *** Reschedule
+        // ***************
+
+        JS_SetContextThread(runnable);
+        JS_BeginRequest(runnable);
+
+        pthread_mutex_unlock(&runnables_mutex);
+
+        // *************************************************************
+        sandbox = JS_GetGlobalObject(runnable);
+
+        if (cast == cast_wait) {
+            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", data);
+            int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('wait', _data)", 19, "main", 0, &rval);
+            if (!ok) {
+                printf("cast did not return ok?!\n");
+            }
+            JS_RemoveValueRoot(runnable, data);        
+        } else if (cast == cast_send) {
+            JSString *to_write_str = JSVAL_TO_STRING(*data);
+            int size = JS_GetStringLength(to_write_str);
+            char * to_write = JS_EncodeString(runnable, to_write_str);
+            int size_sent = send(intval, to_write, size, 0);
+            if (size_sent == -1) {
+                printf("Error writing to fd %d (%d)\n", intval, errno);
+            } else {
+                jsval *fd = (jsval *)malloc(sizeof(jsval));
+                JS_NewNumberValue(runnable, intval, fd);
+                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_fd", fd);
+                jsval *sent_js = (jsval *)malloc(sizeof(jsval));
+                JS_NewNumberValue(runnable, size_sent, sent_js);
+                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_sent", sent_js);
+                JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
+                ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('send', [_fd, _sent, _tag])", 32, "main", 0, &rval);
+                if (!ok) {
+                    printf("cast did not return ok?!\n");
+                }
+            }
+        } else if (cast == cast_recv) {
+            int32 howmuch;
+            JS_ValueToInt32(runnable, *data, &howmuch);
+            char * buffer = (char *)malloc(howmuch);
+
+            uint32 amountread = recv(intval, buffer, howmuch, 0);
+            buffer[amountread] = NULL;
+            jsval the_string = STRING_TO_JSVAL(JS_NewStringCopyN(runnable, buffer, amountread));
+            jsval *fd = (jsval *)malloc(sizeof(jsval));
+            JS_NewNumberValue(runnable, intval, fd);
+
+            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_fd", fd);
+            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", &the_string);
+            if (tag) {
+            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_tag", tag);
+                ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('recv', [_fd, _data, _tag])", 32, "main", 0, &rval);
+            } else {
+                ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('recv', [_fd, _data])", 26, "main", 0, &rval);
+            }
+            if (!ok) {
+                printf("cast did not return ok?!\n");
+            }
+
+            JS_RemoveValueRoot(runnable, data);
+            JS_RemoveValueRoot(runnable, tag);
+        } else if (cast == cast_url) {
+            JS_SetProperty(runnable, JS_GetGlobalObject(runnable), "_data", data);
+            int ok = JS_EvaluateScript(runnable, JS_GetGlobalObject(runnable), "cast('url', _data)", 18, "main", 0, &rval);
+            if (!ok) {
+                printf("cast did not return ok?!\n");
+            }
+            JS_RemoveValueRoot(runnable, data);        
+        }
+
+        ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
+        if (!ok) {
+            printf("resume did not return ok?!\n");
+        }
+
+        JS_EndRequest(runnable);
+        JS_ClearContextThread(runnable);
+
+        pthread_mutex_lock(&reschedule_mutex);
+        if (continuation->next) {
+            schedule_actor(continuation->next);
+        }
+        pthread_mutex_unlock(&reschedule_mutex);
+
+        free(continuation);
+        if (JSVAL_IS_NULL(rval)) {
+            // The Actor has finished, can can destroy it's context.
+            pthread_mutex_lock(&actors_mutex);
+            JS_DestroyContext(runnable);
+            actors_outstanding--;
+            if (!actors_outstanding) {
+                // TODO signal the async signal
+                pthread_cond_signal(&schedule_condition);
+                pthread_mutex_unlock(&schedule_mutex);
+            }
+            pthread_mutex_unlock(&actors_mutex);
+        }
+        // *************************************************************
+    }
+}
+
+// Main servo program.
+// Read urls from command line arguments, and start one
+// servo.js actor per url.
+
+int main(int argc, const char *argv[]) {
+    int ok;
+    pthread_t threads[NUM_THREADS];
+    struct ev_loop * loop = ev_default_loop(0); 
+    rt = JS_NewRuntime(RUNTIME_SIZE);
     if (rt == NULL)
         return 1;
+
+    JSContext *cx = JS_NewContext(rt, 8192);
+    if (cx == NULL)
+        return NULL;
+
+    JS_SetOptions(cx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
+    JS_SetVersion(cx, JSVERSION_LATEST);
+    JS_SetErrorReporter(cx, report_error);
+
+#if DEBUG_SPEW
+    JS_SetInterrupt(cx->runtime, &SpewHook, NULL);
+#endif
+
+    JSObject  *global = JS_NewCompartmentAndGlobalObject(cx, &global_class, NULL);
+    if (global == NULL)
+        return NULL;
+
+    JS_SetGlobalObject(cx, global);
+    if (!JS_InitStandardClasses(cx, global))
+        return NULL;
+    if (!JS_DefineFunctions(cx, global, servo_global_functions))
+        return NULL;
+
+    cast_wait = (jsval *)malloc(sizeof(jsval));
+    cast_send = (jsval *)malloc(sizeof(jsval));
+    cast_recv = (jsval *)malloc(sizeof(jsval));
+    cast_url = (jsval *)malloc(sizeof(jsval));
+
+    JS_SetContextThread(cx);
+    JS_BeginRequest(cx);
+
+    ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'wait'", 6, "main", 0, cast_wait);
+    ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'send'", 6, "main", 0, cast_send);
+    ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'recv'", 6, "main", 0, cast_recv);
+    ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'url'", 5, "main", 0, cast_url);
+
+    JS_AddValueRoot(cx, cast_wait);
+    JS_AddValueRoot(cx, cast_send);
+    JS_AddValueRoot(cx, cast_recv);
+    JS_AddValueRoot(cx, cast_url);
 
     for (int i = 1; i < argc; i++) {
         JSContext * new_actor = spawn(rt, "servo.js");
         if (!new_actor)
             return 1;
+        
+        jsval urlstr = STRING_TO_JSVAL(JS_NewStringCopyZ(new_actor, argv[i]));
+        JS_AddValueRoot(cx, &urlstr);
+        schedule_cast(new_actor, cast_url, &urlstr, NULL);
+    }
+    JS_EndRequest(cx);
+    JS_ClearContextThread(cx);
 
-        jsval url = STRING_TO_JSVAL(JS_NewStringCopyZ(new_actor, argv[i]));
-        JS_SetProperty(
-            new_actor, JS_GetGlobalObject(new_actor),
-            "_url", &url);
-        ok = JS_EvaluateScript(
-            new_actor, JS_GetGlobalObject(new_actor),
-            "cast('url', _url)", 17, "main", 0, &rval);
+    for (int i = 0; i < NUM_THREADS; i++) {
+        ok = pthread_create(&threads[i], NULL, thread_main, (void *)&rt);
+        if (ok != 0) {
+            printf("pthread_create had an error %d\n", ok);
+        }
     }
 
-    // *************************************************************
-    while (runnables_outstanding) {
-        while (runnables_outstanding) {
-            continuation = runnables[--runnables_outstanding];
-            runnable = continuation->cx;
-            // This contination was consumed, free it.
-            free(continuation);
-
-            sandbox = JS_GetGlobalObject(runnable);
-            ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
-            if (!ok) {
-                return 1;
-            }
-            if (rval == JSVAL_NULL) {
-                // The Actor has finished, can can destroy it's context.
-                JS_DestroyContext(runnable);
-			}
-            // *************************************************************
+    while (1) {
+        pthread_mutex_lock(&schedule_mutex);
+        if (!schedule_outstanding) {
+            pthread_cond_wait(&schedule_condition, &schedule_mutex);
         }
+        while (schedule_outstanding) {
+            Continuation *to_schedule = schedule[--schedule_outstanding];
+            if (to_schedule->cast == cast_wait) {
+                ev_timer *timer = (ev_timer *)malloc(sizeof(ev_timer));
+                ev_timer_init(timer, timer_callback, to_schedule->intval / 1000.0, 0.);
+                timer->data = (void *)to_schedule;
+                ev_timer_start(loop, timer);
+            } else if (to_schedule->cast == cast_send) {
+                ev_io *io = (ev_io *)malloc(sizeof(ev_io));
+                ev_io_init(io, io_callback, to_schedule->intval, EV_WRITE);
+                io->data = (void *)to_schedule;
+                ev_io_start(loop, io);
+            } else if (to_schedule->cast == cast_recv) {
+                ev_io *io = (ev_io *)malloc(sizeof(ev_io));
+                ev_io_init(io, io_callback, to_schedule->intval, EV_READ);
+                io->data = (void *)to_schedule;
+                ev_io_start(loop, io);
+            } else {
+                printf("Ignored unknown schedule event\n");
+            }
+        }
+        pthread_mutex_unlock(&schedule_mutex);
+
+        pthread_mutex_lock(&actors_mutex);
+        if (!actors_outstanding) {
+            pthread_mutex_unlock(&actors_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&actors_mutex);
+        
         ev_run(loop, 0);
     }
+
+    shutting_down = 1;
+    pthread_cond_broadcast(&runnables_condition);
 
     /* Clean things up and shut down SpiderMonkey. */
     JS_DestroyRuntime(rt);
     JS_ShutDown();
+
+    for (int j = 0; j < NUM_THREADS; j++) {
+        pthread_cancel(threads[j]);
+    }
+
+    pthread_exit(NULL);
+
     return 0;
 }
