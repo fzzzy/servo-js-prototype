@@ -138,6 +138,9 @@
                 _gen_stack.pop()
                 _gen_stack.push(_drain());
                 _next = _gen_stack[0].next();
+                if (_next === _sentinel) {
+                    return null;
+                }
             } else {
                 _err("Warning: Unknown event:", _next);
                 return;
@@ -232,7 +235,6 @@
         HEADERS_RECEIVED: 2,
         LOADING: 3,
         DONE: 4,
-        _id: 0,
         onreadystatechange: function() {},
         open: function open(method, url, async, user, pw) {
             let parts = urlparse(url);
@@ -383,6 +385,7 @@
                 }
             }
         }
+        yield _sentinel;
     }
 
     function resume() {

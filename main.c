@@ -10,6 +10,8 @@
 #include "ev.h"
 #include "jsapi.h"
 
+JSContext *spawn(JSRuntime *rt, const char * filename);
+
 #define DEBUG_SPEW 0
 
 // todo move this to command line parameter
@@ -54,6 +56,7 @@ static jsval * cast_wait = NULL;
 static jsval * cast_send = NULL;
 static jsval * cast_recv = NULL;
 static jsval * cast_url = NULL;
+static jsval * cast_spawn = NULL;
 
 JSBool schedule_actor(Continuation * cont) {
     pthread_mutex_lock(&runnables_mutex);
@@ -123,6 +126,29 @@ int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
     } else {
         cnt->tag = NULL;
     }
+
+    schedule[schedule_outstanding++] = cnt;
+    pthread_cond_signal(&schedule_condition);
+    pthread_mutex_unlock(&schedule_mutex);
+    return 1;
+}
+
+int main_schedule_spawn(JSContext * cx, JSString * url) {
+    pthread_mutex_lock(&schedule_mutex);
+    if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
+        // TODO block until space.
+        pthread_mutex_unlock(&schedule_mutex);
+        return 0;
+    }
+
+    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
+    cnt->cx = cx;
+
+    cnt->data = (jsval *)JS_EncodeString(cx, url); // so unsafe
+    cnt->cast = cast_spawn;
+    cnt->intval = 0;
+    cnt->next = NULL;
+    cnt->tag = NULL;
 
     schedule[schedule_outstanding++] = cnt;
     pthread_cond_signal(&schedule_condition);
@@ -278,6 +304,19 @@ JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
+JSBool servo_spawn(JSContext *cx, uintN argc, jsval *vp) {
+    JSString * data;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S", &data);
+    if (!result) {
+        JS_ReportError(cx, "Invalid arguments: expected fileno, data");
+        return JS_FALSE;
+    }
+
+    main_schedule_spawn(cx, data);
+
+    return JS_TRUE;
+}
+
 // ****************************************************
 // Boilerplate embedding stuff
 // ****************************************************
@@ -338,6 +377,7 @@ static JSFunctionSpec servo_global_functions[] = {
     JS_FS("schedule_timer", servo_schedule_timer, 1, 0),
     JS_FS("schedule_read", servo_schedule_read, 1, 0),
     JS_FS("schedule_write", servo_schedule_write, 1, 0),
+    JS_FS("spawn", servo_spawn, 1, 0),
     JS_FN("print", servo_print, 0, 0),
     JS_FS_END
 };
@@ -653,6 +693,7 @@ int main(int argc, const char *argv[]) {
     cast_send = (jsval *)malloc(sizeof(jsval));
     cast_recv = (jsval *)malloc(sizeof(jsval));
     cast_url = (jsval *)malloc(sizeof(jsval));
+    cast_spawn = (jsval *)malloc(sizeof(jsval));
 
     JS_SetContextThread(cx);
     JS_BeginRequest(cx);
@@ -661,11 +702,13 @@ int main(int argc, const char *argv[]) {
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'send'", 6, "main", 0, cast_send);
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'recv'", 6, "main", 0, cast_recv);
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'url'", 5, "main", 0, cast_url);
+    ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'spawn'", 7, "main", 0, cast_spawn);
 
     JS_AddValueRoot(cx, cast_wait);
     JS_AddValueRoot(cx, cast_send);
     JS_AddValueRoot(cx, cast_recv);
     JS_AddValueRoot(cx, cast_url);
+    JS_AddValueRoot(cx, cast_spawn);
 
     for (int i = 1; i < argc; i++) {
         JSContext * new_actor = spawn(rt, "servo.js");
@@ -717,6 +760,16 @@ int main(int argc, const char *argv[]) {
                 ev_io_init(io, io_callback, to_schedule->intval, EV_READ);
                 io->data = (void *)to_schedule;
                 ev_io_start(loop, io);
+            } else if (to_schedule->cast == cast_spawn) {
+                JS_SetContextThread(cx);
+                JS_BeginRequest(cx);
+
+                spawn(rt, (const char *)to_schedule->data);
+
+                JS_EndRequest(cx);
+                JS_ClearContextThread(cx);
+                pthread_mutex_unlock(&schedule_mutex);
+                continue;
             } else {
                 printf("Ignored unknown schedule event\n");
             }

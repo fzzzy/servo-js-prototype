@@ -1,5 +1,6 @@
 
 function mutation(evt) {
+    return;
     var domjsNodeStr = evt.child;
     if (domjsNodeStr === undefined) {
         if (evt.type === 2) {
@@ -56,6 +57,8 @@ xhr.onreadystatechange = function() {
     if (this.readyState === 4) {
         var newdoc = document.implementation.mozHTMLParser(mutation).end(this.responseText);
         print(newdoc);
+        spawn('foo.js');
+        print("we done!");
         //window.parseHtmlDocument(this.responseText, document, cb, null);
     }
 }
