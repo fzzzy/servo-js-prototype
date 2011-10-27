@@ -1,7 +1,5 @@
-print("ACTORS", actors);
 
 function mutation(evt) {
-    return;
     var domjsNodeStr = evt.child;
     if (domjsNodeStr === undefined) {
         if (evt.type === 2) {
@@ -65,14 +63,10 @@ xhr.onreadystatechange = function() {
 let url = yield receive("url");
 print("Loading", url);
 
-
-        print("wespawn!");
-        var res = spawn('foo.js', 1);
-        //res('foo', 1);
-        print("we done!");
-        yield receive('spawn');
-        print("we got a spawn!");
-
+spawn('foo.js', 1);
+let res = yield receive('spawn');
+let address = actors[res];
+address('foo', "what's happenin!");
 
 xhr.open("GET", url);
 xhr.send("");

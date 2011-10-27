@@ -160,8 +160,33 @@ void main_schedule_spawn(JSContext * cx, JSString * url, uint32 tag) {
     pthread_mutex_unlock(&schedule_mutex);
 }
 
-int main_schedule_cast(JSContext * cx, JSObject * to_cast) {
-    printf("main schedule cast!\n");
+void main_schedule_cast(JSContext * cx, JSString * pattern, JSString * data) {
+    pthread_mutex_lock(&schedule_mutex);
+    if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
+        // TODO block until space.
+        pthread_mutex_unlock(&schedule_mutex);
+        return;
+    }    
+    Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
+    cnt->cx = cx;
+
+    size_t pattern_len = JS_GetStringEncodingLength(cx, pattern);
+    cnt->cast = (jsval *)malloc(pattern_len + 1);
+    JS_EncodeStringToBuffer(pattern, (char *)cnt->cast, pattern_len);
+    ((char *)cnt->cast)[pattern_len] = NULL;
+
+    size_t data_len = JS_GetStringEncodingLength(cx, data);
+    cnt->data = (jsval *)malloc(data_len + 1);
+    JS_EncodeStringToBuffer(data, (char *)cnt->data, data_len); 
+    ((char *)cnt->data)[data_len] = NULL;
+
+    cnt->intval = 0;
+    cnt->next = NULL;
+    cnt->tag = NULL;
+
+    schedule[schedule_outstanding++] = cnt;
+    pthread_cond_signal(&schedule_condition);
+    pthread_mutex_unlock(&schedule_mutex);
 }
 
 #pragma mark libev callbacks
@@ -333,14 +358,16 @@ JSBool servo_spawn(JSContext *cx, uintN argc, jsval *vp) {
 
 JSBool servo_cast(JSContext *cx, uintN argc, jsval *vp) {
     JSString * pattern;
-    JSObject * data;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S", &pattern, &data);
+    JSString * data;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "SS", &pattern, &data);
     if (!result) {
-        JS_ReportError(cx, "Invalid arguments: expected pattern, message");
+        JS_ReportError(cx, "Invalid arguments: expected pattern, jsonmessage");
         return JS_FALSE;
     }
 
-    printf("CAST!\n");
+    jsval callee = JS_CALLEE(cx, vp);
+    JSContext * other = (JSContext *)JS_GetPrivate(cx, JSVAL_TO_OBJECT(callee));
+    main_schedule_cast(other, pattern, data);
     return JS_TRUE;
 }
 
@@ -367,6 +394,24 @@ static JSClass global_class = {
     JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
     JS_EnumerateStub, (JSResolveOp)global_resolve, JS_ConvertStub, JS_FinalizeStub,
     JSCLASS_NO_OPTIONAL_MEMBERS
+};
+/*
+static JSClass address_class = {
+    "Address", 
+    JSCLASS_HAS_PRIVATE, 
+    JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_PropertyStub,
+    JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
+    JSCLASS_NO_OPTIONAL_MEMBERS
+};
+*/
+static JSClass address_class = {
+    "Address",
+    JSCLASS_HAS_PRIVATE,
+    JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
+    JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
+    NULL, NULL,
+    servo_cast,
+    NULL, NULL, NULL, NULL, NULL, NULL
 };
 
 void report_error(JSContext *cx, const char *message, JSErrorReport *report) {
@@ -444,7 +489,7 @@ JSContext *make_context(JSRuntime *rt) {
     if (global == NULL)
         return NULL;
 
-    JS_DefineObject(cx, global, "actors", NULL, NULL, 0);
+    JSObject *actors_array = JS_DefineObject(cx, global, "actors", NULL, NULL, 0);
 
     JS_SetGlobalObject(cx, global);
     if (!JS_InitStandardClasses(cx, global))
@@ -567,7 +612,9 @@ void * thread_main(void * runtime_in) {
         continuation = runnables[--runnables_outstanding];
 
         if (continuation->cx == NULL) {
-            printf("message sent to dead actor.");
+            printf("message sent to dead actor.\n");
+            pthread_mutex_unlock(&runnables_mutex);
+            continue;
         }
         runnable = continuation->cx;
         data = continuation->data;
@@ -677,12 +724,36 @@ void * thread_main(void * runtime_in) {
             }
             JS_RemoveValueRoot(runnable, data);        
         } else if (cast == cast_spawn) {
+            jsval actorsobj;
+            JS_GetProperty(runnable, sandbox, "actors", &actorsobj);
+            uint32 intval = JSVAL_TO_INT(*tag);
+            JSObject * objval = JSVAL_TO_OBJECT(actorsobj);
+            JS_SetElement(runnable, objval, intval, data);
+
             JS_SetProperty(runnable, sandbox, "_tag", tag);
             int ok = JS_EvaluateScript(runnable, sandbox, "cast('spawn', _tag)", 19, "main", 0, &rval);
             if (!ok) {
                 printf("cast did not return ok?!\n");
             }
             JS_RemoveValueRoot(runnable, tag);        
+        } else if (cast) {
+            JSString *newpat = JS_NewStringCopyN(
+                runnable, (char *)cast, strlen((char *)cast));
+            free((char *)cast);
+            JSString *newdata = JS_NewStringCopyN(
+                runnable, (char *)data, strlen((char *)data));
+            free((char *)data);
+
+            jsval patval = STRING_TO_JSVAL(newpat);
+            jsval datval = STRING_TO_JSVAL(newdata);
+            JS_SetProperty(runnable, sandbox, "_pattern", &patval);
+            JS_SetProperty(runnable, sandbox, "_data", &datval);
+            int ok = JS_EvaluateScript(runnable, sandbox, "cast(_pattern, _data)", 21, "main", 0, &rval);
+            if (!ok) {
+                printf("cast did not return ok?!\n");
+            }
+        } else {
+            //printf("something else...\n");
         }
 
         ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
@@ -722,6 +793,8 @@ void * thread_main(void * runtime_in) {
 // Read urls from command line arguments, and start one
 // servo.js actor per url.
 
+
+
 int main(int argc, const char *argv[]) {
     int ok;
     pthread_t threads[NUM_THREADS];
@@ -745,6 +818,10 @@ int main(int argc, const char *argv[]) {
     JS_SetContextThread(cx);
     JS_BeginRequest(cx);
     
+    JSObject * address_class_object = JS_InitClass(
+        cx, JS_GetGlobalObject(cx), NULL,
+        &address_class, NULL, 0, NULL, NULL, NULL, NULL);
+
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'wait'", 6, "main", 0, cast_wait);
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'send'", 6, "main", 0, cast_send);
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'recv'", 6, "main", 0, cast_recv);
@@ -814,21 +891,26 @@ int main(int argc, const char *argv[]) {
                 JSContext * new_context = spawn(
                     rt, (const char *)to_schedule->data);
 
-//                JS_DefineObject(
                 jsval * tagval = (jsval *)JS_malloc(to_schedule->cx, sizeof(jsval));
                 JS_NewNumberValue(to_schedule->cx, to_schedule->intval, tagval);
                 JS_AddValueRoot(to_schedule->cx, tagval);
-                schedule_cast(to_schedule->cx, cast_spawn, NULL, tagval);
+                JSObject * addr_instance = JS_NewObject(
+                    cx, &address_class, NULL, NULL);
+                JS_SetPrivate(cx, addr_instance, new_context);
+
+                jsval * addr_jsval = (jsval *)malloc(sizeof(jsval));
+                *addr_jsval = OBJECT_TO_JSVAL(addr_instance);
+                schedule_cast(to_schedule->cx, cast_spawn, addr_jsval, tagval);
                 //schedule_actor(new_context);
                 
                 //JS_DefineObject(cx, 
 
                 JS_EndRequest(cx);
                 JS_ClearContextThread(cx);
-                pthread_mutex_unlock(&schedule_mutex);
                 continue;
             } else {
-                printf("Ignored unknown schedule event\n");
+                schedule_actor(to_schedule);
+                continue;
             }
         }
         pthread_mutex_unlock(&schedule_mutex);
