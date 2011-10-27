@@ -11,13 +11,19 @@
 #include "jsapi.h"
 
 JSContext *spawn(JSRuntime *rt, const char * filename);
+JSBool servo_cast(JSContext *cx, uintN argc, jsval *vp);
 
 #define DEBUG_SPEW 0
+
+// TODO switch to using JS_EncodeString everywhere and free the result
+// JS_free (cx, p)
 
 // todo move this to command line parameter
 #define NUM_THREADS 4
 // calculate somehow?
 #define RUNTIME_SIZE 32 * 1024 * 1024
+
+#pragma mark inter-thread queues
 
 // ****************************************************
 // Managing the set of Actors that are ready to run
@@ -85,7 +91,7 @@ JSBool schedule_cast(JSContext *cx, jsval * cast, jsval * data, jsval * tag) {
 int main_schedule_io(JSContext * cx, jsval * cast, jsval * data, jsval * tag, int fileno) {
     pthread_mutex_lock(&schedule_mutex);
     if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
-        // TODO block until space.
+        // !!! TODO block until space.
         pthread_mutex_unlock(&schedule_mutex);
         return JS_FALSE;
     }
@@ -133,28 +139,32 @@ int main_schedule_timer(JSContext * cx, uint32 timeout, uint32 tag) {
     return 1;
 }
 
-int main_schedule_spawn(JSContext * cx, JSString * url) {
+void main_schedule_spawn(JSContext * cx, JSString * url, uint32 tag) {
     pthread_mutex_lock(&schedule_mutex);
     if (schedule_outstanding == MAX_SCHEDULE_OUTSTANDING) {
         // TODO block until space.
         pthread_mutex_unlock(&schedule_mutex);
-        return 0;
-    }
-
+        return;
+    }    
     Continuation * cnt = (Continuation *)malloc(sizeof(Continuation));
     cnt->cx = cx;
 
     cnt->data = (jsval *)JS_EncodeString(cx, url); // so unsafe
     cnt->cast = cast_spawn;
-    cnt->intval = 0;
+    cnt->intval = tag;
     cnt->next = NULL;
     cnt->tag = NULL;
 
     schedule[schedule_outstanding++] = cnt;
     pthread_cond_signal(&schedule_condition);
     pthread_mutex_unlock(&schedule_mutex);
-    return 1;
 }
+
+int main_schedule_cast(JSContext * cx, JSObject * to_cast) {
+    printf("main schedule cast!\n");
+}
+
+#pragma mark libev callbacks
 
 // ****************************************************
 // Callbacks from libev into the actor scheduler.
@@ -175,6 +185,8 @@ static void io_callback(EV_P_ ev_io *w, int revents) {
     free(w);
 }
 
+#pragma mark api exposed to actors in js
+
 // ****************************************************
 // api exposed to Actors:
 //  fileno = connect(host, port)
@@ -182,6 +194,8 @@ static void io_callback(EV_P_ ev_io *w, int revents) {
 //  schedule_timer(timeout, request_id)
 //  schedule_read(fileno, howmuch, request_id)
 //  schedule_write(fileno, towrite, request_id)
+//  address = spawn(url)
+//  address.cast(obj)
 // ****************************************************
 
 // *** fileno = connect(host, port)
@@ -306,16 +320,31 @@ JSBool servo_schedule_write(JSContext *cx, uintN argc, jsval *vp) {
 
 JSBool servo_spawn(JSContext *cx, uintN argc, jsval *vp) {
     JSString * data;
-    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S", &data);
+    uint32 tag;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "Su", &data, &tag);
     if (!result) {
-        JS_ReportError(cx, "Invalid arguments: expected fileno, data");
+        JS_ReportError(cx, "Invalid arguments: expected filename, tag");
         return JS_FALSE;
     }
 
-    main_schedule_spawn(cx, data);
-
+    main_schedule_spawn(cx, data, tag);
     return JS_TRUE;
 }
+
+JSBool servo_cast(JSContext *cx, uintN argc, jsval *vp) {
+    JSString * pattern;
+    JSObject * data;
+    int result = JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S", &pattern, &data);
+    if (!result) {
+        JS_ReportError(cx, "Invalid arguments: expected pattern, message");
+        return JS_FALSE;
+    }
+
+    printf("CAST!\n");
+    return JS_TRUE;
+}
+
+#pragma mark boilerplate embedding stuff
 
 // ****************************************************
 // Boilerplate embedding stuff
@@ -347,9 +376,7 @@ void report_error(JSContext *cx, const char *message, JSErrorReport *report) {
         (unsigned int) report->lineno, message);
 }
 
-static JSBool
-servo_print(JSContext *cx, uintN argc, jsval *vp)
-{
+static JSBool servo_print(JSContext *cx, uintN argc, jsval *vp) {
     jsval *argv;
     uintN i;
     JSString *str;
@@ -393,6 +420,8 @@ JSTrapStatus SpewHook(JSContext *cx, JSScript *script, jsbytecode *pc, jsval *rv
 }
 #endif
 
+#pragma mark c actor management api
+
 // ****************************************************
 // API for servo to start Actors.
 // ****************************************************
@@ -415,6 +444,8 @@ JSContext *make_context(JSRuntime *rt) {
     if (global == NULL)
         return NULL;
 
+    JS_DefineObject(cx, global, "actors", NULL, NULL, 0);
+
     JS_SetGlobalObject(cx, global);
     if (!JS_InitStandardClasses(cx, global))
         return NULL;
@@ -434,9 +465,10 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
 
     pthread_mutex_lock(&actors_mutex);
     actors_outstanding++;
+    JSContext * cx = make_context(rt);
+    printf("[%p] spawn (total %d)\n", cx, actors_outstanding);
     pthread_mutex_unlock(&actors_mutex);
 
-    JSContext * cx = make_context(rt);
     JSObject  *global = JS_GetGlobalObject(cx);
 
     JS_SetContextThread(cx);
@@ -499,6 +531,8 @@ JSContext *spawn(JSRuntime *rt, const char * filename) {
     return cx;
 }
 
+#pragma mark main loop for js-running threads
+
 // Main actor dispatcher.
 void * thread_main(void * runtime_in) {
     JSRuntime *rt = (JSRuntime *)runtime_in;
@@ -532,6 +566,9 @@ void * thread_main(void * runtime_in) {
         }
         continuation = runnables[--runnables_outstanding];
 
+        if (continuation->cx == NULL) {
+            printf("message sent to dead actor.");
+        }
         runnable = continuation->cx;
         data = continuation->data;
         tag = continuation->tag;
@@ -639,6 +676,13 @@ void * thread_main(void * runtime_in) {
                 printf("cast did not return ok?!\n");
             }
             JS_RemoveValueRoot(runnable, data);        
+        } else if (cast == cast_spawn) {
+            JS_SetProperty(runnable, sandbox, "_tag", tag);
+            int ok = JS_EvaluateScript(runnable, sandbox, "cast('spawn', _tag)", 19, "main", 0, &rval);
+            if (!ok) {
+                printf("cast did not return ok?!\n");
+            }
+            JS_RemoveValueRoot(runnable, tag);        
         }
 
         ok = JS_EvaluateScript(runnable, sandbox, "resume()", 8, "main", 0, &rval);
@@ -662,6 +706,7 @@ void * thread_main(void * runtime_in) {
             pthread_mutex_lock(&actors_mutex);
             JS_DestroyContext(runnable);
             actors_outstanding--;
+            printf("[%p] actor dead (left %d)\n", runnable, actors_outstanding);
             if (!actors_outstanding) {
                 pthread_cond_signal(&schedule_condition);
             }
@@ -670,6 +715,8 @@ void * thread_main(void * runtime_in) {
         // *************************************************************
     }
 }
+
+#pragma mark main loop and libev loop
 
 // Main servo program.
 // Read urls from command line arguments, and start one
@@ -697,7 +744,7 @@ int main(int argc, const char *argv[]) {
 
     JS_SetContextThread(cx);
     JS_BeginRequest(cx);
-
+    
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'wait'", 6, "main", 0, cast_wait);
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'send'", 6, "main", 0, cast_send);
     ok = JS_EvaluateScript(cx, JS_GetGlobalObject(cx), "'recv'", 6, "main", 0, cast_recv);
@@ -764,7 +811,17 @@ int main(int argc, const char *argv[]) {
                 JS_SetContextThread(cx);
                 JS_BeginRequest(cx);
 
-                spawn(rt, (const char *)to_schedule->data);
+                JSContext * new_context = spawn(
+                    rt, (const char *)to_schedule->data);
+
+//                JS_DefineObject(
+                jsval * tagval = (jsval *)JS_malloc(to_schedule->cx, sizeof(jsval));
+                JS_NewNumberValue(to_schedule->cx, to_schedule->intval, tagval);
+                JS_AddValueRoot(to_schedule->cx, tagval);
+                schedule_cast(to_schedule->cx, cast_spawn, NULL, tagval);
+                //schedule_actor(new_context);
+                
+                //JS_DefineObject(cx, 
 
                 JS_EndRequest(cx);
                 JS_ClearContextThread(cx);

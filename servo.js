@@ -1,3 +1,4 @@
+print("ACTORS", actors);
 
 function mutation(evt) {
     return;
@@ -57,14 +58,22 @@ xhr.onreadystatechange = function() {
     if (this.readyState === 4) {
         var newdoc = document.implementation.mozHTMLParser(mutation).end(this.responseText);
         print(newdoc);
-        spawn('foo.js');
-        print("we done!");
         //window.parseHtmlDocument(this.responseText, document, cb, null);
     }
 }
 
 let url = yield receive("url");
 print("Loading", url);
+
+
+        print("wespawn!");
+        var res = spawn('foo.js', 1);
+        //res('foo', 1);
+        print("we done!");
+        yield receive('spawn');
+        print("we got a spawn!");
+
+
 xhr.open("GET", url);
 xhr.send("");
 
