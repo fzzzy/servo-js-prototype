@@ -356,6 +356,7 @@ JSBool servo_spawn(JSContext *cx, uintN argc, jsval *vp) {
     return JS_TRUE;
 }
 
+// This is only accessible as the return value of spawn.
 JSBool servo_cast(JSContext *cx, uintN argc, jsval *vp) {
     JSString * pattern;
     JSString * data;
@@ -395,15 +396,7 @@ static JSClass global_class = {
     JS_EnumerateStub, (JSResolveOp)global_resolve, JS_ConvertStub, JS_FinalizeStub,
     JSCLASS_NO_OPTIONAL_MEMBERS
 };
-/*
-static JSClass address_class = {
-    "Address", 
-    JSCLASS_HAS_PRIVATE, 
-    JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_PropertyStub,
-    JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
-    JSCLASS_NO_OPTIONAL_MEMBERS
-};
-*/
+
 static JSClass address_class = {
     "Address",
     JSCLASS_HAS_PRIVATE,
