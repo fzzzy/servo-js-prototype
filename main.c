@@ -1,4 +1,3 @@
-
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -65,16 +64,18 @@ static jsval * cast_url = NULL;
 static jsval * cast_spawn = NULL;
 
 JSBool schedule_actor(Continuation * cont) {
+    JSBool success = JS_FALSE;
     pthread_mutex_lock(&runnables_mutex);
-    if (runnables_outstanding == MAX_RUNNABLES_OUTSTANDING) {
-        // TODO block until space.
-        pthread_mutex_unlock(&runnables_mutex);
-        return JS_FALSE;
+    
+    if (runnables_outstanding < MAX_RUNNABLES_OUTSTANDING) {
+        runnables[runnables_outstanding++] = cont;
+        pthread_cond_signal(&runnables_condition);
+        success = JS_TRUE;
     }
-    runnables[runnables_outstanding++] = cont;
-    pthread_cond_signal(&runnables_condition);
+    // TODO otherwise block until space.
+    
     pthread_mutex_unlock(&runnables_mutex);
-    return JS_TRUE;
+    return success;
 }
 
 JSBool schedule_cast(JSContext *cx, jsval * cast, jsval * data, jsval * tag) {
